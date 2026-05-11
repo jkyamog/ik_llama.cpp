@@ -80,7 +80,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             }
         }
 
-        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], im);
+        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], im, nullptr);
         GGML_ASSERT(ggml_validate_row_data(tensor->type, dataq.data(), dataq.size()));
         // TODO: other cases
         //#pragma omp parallel for
@@ -988,6 +988,52 @@ struct test_mul_mat : public test_case {
         ggml_tensor * b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0]*nr[0], bs[1]*nr[1]);
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
         return out;
+    }
+};
+
+struct test_mul_mat_q8_0_overflow : public test_case {
+    static constexpr int64_t m = 16;
+    static constexpr int64_t n = 128;
+    static constexpr int64_t k = 1024;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_Q8_0_OVERFLOW";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "q8_0_large_dot_a");
+        ggml_set_name(b, "q8_0_large_dot_b");
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q8_0_large_dot_a") == 0) {
+                std::vector<float> data(ggml_nelements(t), 100.0f);
+                std::vector<uint8_t> dataq(ggml_row_size(t->type, ggml_nelements(t)));
+                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, t->ne[1], t->ne[0], nullptr, nullptr);
+                GGML_ASSERT(ggml_validate_row_data(t->type, dataq.data(), dataq.size()));
+                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+            } else if (strcmp(t->name, "q8_0_large_dot_b") == 0) {
+                std::vector<float> data(ggml_nelements(t), -1.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -2297,6 +2343,8 @@ static bool test_backend(ggml_backend_t backend, test_mode mode, const char * op
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,   64, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 45, 128, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 45,  64, { 8,  1}, {4, 1}));
+
+    test_cases.emplace_back(new test_mul_mat_q8_0_overflow());
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
