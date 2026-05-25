@@ -6141,6 +6141,82 @@ struct ggml_tensor * ggml_reduce(
     return result;
 }
 
+static void ggml_compute_forward_reduce_add(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    GGML_ASSERT(dst->op_params[0] == GGML_OP_ADD);
+
+    const int nreduce = dst->op_params[1];
+    const int nhave   = dst->op_params[2];
+    GGML_ASSERT(nreduce > 1 && nreduce <= GGML_MAX_SRC);
+    GGML_ASSERT(nhave > 1 && nhave <= nreduce);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    if (dst->op_params[3] == 1) {
+        return;
+    }
+
+    for (int i = 0; i < nreduce; ++i) {
+        if (dst->src[i] == NULL) {
+            continue;
+        }
+        GGML_ASSERT(dst->src[i]->type == dst->type);
+        GGML_ASSERT(ggml_are_same_shape(dst->src[i], dst));
+        GGML_ASSERT(ggml_is_contiguous(dst->src[i]));
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t ne = ggml_nelements(dst);
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, ne);
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            {
+                float * d = (float *) dst->data;
+                for (int64_t j = ir0; j < ir1; ++j) {
+                    float sum = 0.0f;
+                    for (int i = 0; i < nreduce; ++i) {
+                        if (dst->src[i] != NULL) {
+                            sum += ((const float *) dst->src[i]->data)[j];
+                        }
+                    }
+                    d[j] = sum;
+                }
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_fp16_t * d = (ggml_fp16_t *) dst->data;
+                for (int64_t j = ir0; j < ir1; ++j) {
+                    float sum = 0.0f;
+                    for (int i = 0; i < nreduce; ++i) {
+                        if (dst->src[i] != NULL) {
+                            sum += GGML_FP16_TO_FP32(((const ggml_fp16_t *) dst->src[i]->data)[j]);
+                        }
+                    }
+                    d[j] = GGML_FP32_TO_FP16(sum);
+                }
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_bf16_t * d = (ggml_bf16_t *) dst->data;
+                for (int64_t j = ir0; j < ir1; ++j) {
+                    float sum = 0.0f;
+                    for (int i = 0; i < nreduce; ++i) {
+                        if (dst->src[i] != NULL) {
+                            sum += GGML_BF16_TO_FP32(((const ggml_bf16_t *) dst->src[i]->data)[j]);
+                        }
+                    }
+                    d[j] = GGML_FP32_TO_BF16(sum);
+                }
+            } break;
+        default:
+            GGML_ABORT("%s: unsupported CPU reduce-add type %s", __func__, ggml_type_name(dst->type));
+    }
+}
+
 struct ggml_tensor * ggml_fake_cpy(
             struct ggml_context         * ctx,
             struct ggml_tensor          * dst,
@@ -24257,8 +24333,9 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
     switch (tensor->op) {
         case GGML_OP_REDUCE:
             {
-                GGML_ABORT("REDUCE not implemented");
+                ggml_compute_forward_reduce_add(params, tensor);
             }
+            break;
         case GGML_OP_FAKE_CPY:
             {
                 GGML_ABORT("FAKE_CPY not implemented");
@@ -26363,6 +26440,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
 
     switch (node->op) {
         case GGML_OP_CPY:
+        case GGML_OP_REDUCE:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
         case GGML_OP_ADD:
