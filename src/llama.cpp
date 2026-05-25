@@ -449,10 +449,19 @@ static size_t llama_get_device_count(const llama_model & model) {
 static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int gpu) {
     ggml_backend_buffer_type_t buft = nullptr;
 
-    // CPU tensor-parallel: handle CPU-node devices (indices 0..cpu_node_count-1)
-    if (model.cpu_tp == 2 && ggml_is_numa() && gpu < (int)model.cpu_node_count) {
-        // Return CPU buffer type for NUMA nodes - actual NUMA-specific allocation in Task 5
+    // CPU tensor-parallel: handle CPU-node devices with NUMA-specific buffer types.
+    if (model.cpu_tp == 2 && ggml_is_numa() && gpu >= 0 && gpu < (int)model.cpu_node_count) {
+#ifdef __gnu_linux__
+        // Return a distinct CPU buffer type for each CPU NUMA node. This identifies
+        // placement for the scheduler; node-local allocation is blocked until
+        // compute/allocation affinity is passed into ggml.c.
+        buft = ggml_backend_cpu_numa_buffer_type((uint32_t)gpu);
+        if (buft == nullptr) {
+            buft = llama_default_buffer_type_cpu(true);
+        }
+#else
         buft = llama_default_buffer_type_cpu(true);
+#endif
         return buft;
     }
 
@@ -6945,18 +6954,23 @@ struct llama_context * llama_init_from_model(
         GGML_UNUSED(main_gpu_id);
         const bool cpu_tp_active = model->cpu_tp == 2 && model->cpu_node_count > 0;
 
-        // CPU tensor-parallel: initialize CPU-node backends (Task 4 minimal plumbing)
+        // CPU tensor-parallel: initialize named CPU-node backends. Per-node
+        // thread affinity is blocked until ggml.c carries backend-local NUMA
+        // state into worker threads.
         if (cpu_tp_active) {
             LLAMA_LOG_INFO("%s: initializing %u CPU-node backend(s) for CPU TP\n", __func__, model->cpu_node_count);
             for (uint32_t node = 0; node < model->cpu_node_count; node++) {
+#ifdef __gnu_linux__
+                ggml_backend_t cpu_node_backend = ggml_backend_cpu_init_with_numa((int32_t)node);
+#else
                 ggml_backend_t cpu_node_backend = ggml_backend_cpu_init();
+#endif
                 if (cpu_node_backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize CPU-NUMA%d backend\n", __func__, node);
                     llama_free(ctx);
                     return nullptr;
                 }
-                // Note: actual NUMA affinity/pinning will be implemented in Task 5
-                LLAMA_LOG_INFO("%s: CPU-NUMA%d backend initialized (placeholder for node-specific affinity)\n", __func__, node);
+                LLAMA_LOG_INFO("%s: CPU-NUMA%d backend initialized (NUMA node %d)\n", __func__, node, node);
                 ctx->backends.push_back(cpu_node_backend);
             }
         }

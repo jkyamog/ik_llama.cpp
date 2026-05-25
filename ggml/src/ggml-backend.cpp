@@ -747,6 +747,63 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type;
 }
 
+#ifdef __gnu_linux__
+static constexpr uint32_t GGML_CPU_NUMA_MAX_NODES = 8;
+
+// NUMA node-specific buffer type for CPU tensor-parallel.
+struct ggml_backend_cpu_numa_buft_ctx {
+    uint32_t numa_node;
+    char name[32];
+};
+
+static const char * ggml_backend_cpu_numa_buft_get_name(ggml_backend_buffer_type_t buft) {
+    struct ggml_backend_cpu_numa_buft_ctx * ctx = (struct ggml_backend_cpu_numa_buft_ctx *)buft->context;
+    return ctx->name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_numa_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    size += TENSOR_ALIGNMENT;
+    void * data = malloc(size);
+    if (data == NULL) {
+        fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
+        return NULL;
+    }
+    return ggml_backend_buffer_init(buft, cpu_backend_buffer_i, data, size);
+}
+
+GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(uint32_t numa_node) {
+    if (numa_node >= GGML_CPU_NUMA_MAX_NODES) {
+        return nullptr;
+    }
+    static ggml_backend_buffer_type_t buft_arr[GGML_CPU_NUMA_MAX_NODES] = {0};
+    static std::mutex buft_mtx;
+    std::lock_guard<std::mutex> lock(buft_mtx);
+    if (buft_arr[numa_node] != nullptr) {
+        return buft_arr[numa_node];
+    }
+    struct ggml_backend_cpu_numa_buft_ctx * ctx =
+        (struct ggml_backend_cpu_numa_buft_ctx *)malloc(sizeof(struct ggml_backend_cpu_numa_buft_ctx));
+    if (ctx == NULL) return nullptr;
+    ctx->numa_node = numa_node;
+    snprintf(ctx->name, sizeof(ctx->name), "CPU-NUMA%d", numa_node);
+    // Allocate a distinct buffer type object for each NUMA node.
+    ggml_backend_buffer_type_t buft = (ggml_backend_buffer_type_t)malloc(sizeof(struct ggml_backend_buffer_type));
+    if (buft == nullptr) {
+        free(ctx);
+        return nullptr;
+    }
+    buft->iface.get_name = ggml_backend_cpu_numa_buft_get_name;
+    buft->iface.alloc_buffer = ggml_backend_cpu_numa_buft_alloc_buffer;
+    buft->iface.get_alignment = ggml_backend_cpu_buffer_type_get_alignment;
+    buft->iface.get_max_size = NULL;
+    buft->iface.get_alloc_size = NULL;
+    buft->iface.is_host = ggml_backend_cpu_buffer_type_is_host;
+    buft->context = ctx;
+    buft_arr[numa_node] = buft;
+    return buft;
+}
+#endif
+
 #ifdef GGML_USE_CPU_HBM
 
 // buffer type HBM
@@ -808,15 +865,34 @@ struct ggml_backend_cpu_context {
     void * work_data;
     size_t work_size;
 
+#ifdef __gnu_linux__
+    int32_t numa_node;  // NUMA node identity for named CPU backends (-1 = none)
+    char name[32];
+#endif
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 };
 
 GGML_CALL static const char * ggml_backend_cpu_name(ggml_backend_t backend) {
+#ifdef __gnu_linux__
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    if (cpu_ctx->numa_node >= 0) {
+        return cpu_ctx->name;
+    }
+#endif
     return "CPU";
 
     GGML_UNUSED(backend);
 }
+
+#ifdef __gnu_linux__
+static void ggml_backend_cpu_set_numa_node(ggml_backend_t backend_cpu, int32_t numa_node) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->numa_node = numa_node;
+    snprintf(ctx->name, sizeof(ctx->name), "CPU-NUMA%d", numa_node);
+}
+#endif
 
 GGML_CALL static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
@@ -958,6 +1034,10 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
+#ifdef __gnu_linux__
+    ctx->numa_node           = -1;
+    snprintf(ctx->name, sizeof(ctx->name), "CPU");
+#endif
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
 
@@ -986,6 +1066,15 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
     ctx->n_threads = n_threads;
 }
 
+#ifdef __gnu_linux__
+ggml_backend_t ggml_backend_cpu_init_with_numa(int32_t numa_node) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (backend != NULL) {
+        ggml_backend_cpu_set_numa_node(backend, numa_node);
+    }
+    return backend;
+}
+#endif
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
 

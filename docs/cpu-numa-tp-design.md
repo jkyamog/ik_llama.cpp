@@ -123,3 +123,25 @@ Validation checks:
 - CLI/API path: add `cpu_tp` to the shared common params and propagate into model initialization. Reject `--cpu-tp 2` with existing `--numa` modes for v1 until interaction is validated.
 
 Task 3 recommendation: proceed with experimental CLI plumbing only. Add `--cpu-tp N` with `0` default, `1` disabled-equivalent logging, `2` request mode, and clear rejection for any other value. Task 3 should only store and validate the request; it should not create CPU-node backends yet.
+
+## Task 5 Revision Status
+
+Task 5 established distinct CPU-node identities but did not complete true NUMA-local execution.
+
+Implemented:
+
+- Linux builds can create distinct `CPU-NUMA0` and `CPU-NUMA1` CPU buffer types.
+- CPU TP model loading uses those buffer types for synthetic CPU-node devices.
+- CPU TP context initialization creates named CPU backend instances for each synthetic node.
+- Invalid NUMA buffer type requests are bounded to avoid out-of-range access.
+
+Not implemented:
+
+- Per-node worker-thread affinity.
+- Guaranteed NUMA-local allocation or first-touch placement.
+
+Blocker:
+
+`ggml_backend_cpu_graph_compute()` ultimately calls `ggml_graph_compute()` in `ggml/src/ggml.c`, where worker threads are created and `set_numa_thread_affinity()` applies the global `--numa` strategy. That path does not receive backend-local NUMA node state, so calling an affinity helper at the backend boundary would only affect the caller thread, not the worker threads. Completing Task 5 requires carrying a per-backend NUMA node through `ggml_cplan` or an equivalent compute API into `ggml_graph_compute_thread()`.
+
+Until that is done, `CPU-NUMA*` buffer/backend names are placement plumbing and auditability only; they should not be treated as proof of node-local memory or compute.
