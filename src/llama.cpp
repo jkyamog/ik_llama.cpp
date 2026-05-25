@@ -503,14 +503,20 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
 static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_model & model, int fallback_gpu) {
     ggml_backend_buffer_type_t buft = nullptr;
 
+#ifdef __gnu_linux__
+    if (model.cpu_tp == 2 && model.cpu_node_count > 1) {
+        buft = ggml_backend_cpu_numa_split_buffer_type();
+    }
+#endif
+
 #ifdef GGML_USE_CUDA
-    if (ggml_backend_cuda_get_device_count() > 1) {
+    if (buft == nullptr && ggml_backend_cuda_get_device_count() > 1) {
         buft = ggml_backend_cuda_split_buffer_type(model.splits.data());
     }
 #endif
 
 #ifdef GGML_USE_SYCL
-    if (ggml_backend_sycl_get_device_count() > 1) {
+    if (buft == nullptr && ggml_backend_sycl_get_device_count() > 1) {
         buft = ggml_backend_sycl_split_buffer_type(model.splits.data());
     }
 #endif

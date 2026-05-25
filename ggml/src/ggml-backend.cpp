@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <set>
@@ -803,6 +804,156 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(uint32_t 
     buft->context = ctx;
     ggml_backend_cpu_numa_buft_arr[numa_node] = buft;
     return buft;
+}
+
+struct ggml_backend_cpu_numa_split_buffer_context {
+    std::vector<ggml_backend_buffer_t> shard_buffers;
+};
+
+GGML_CALL static const char * ggml_backend_cpu_numa_split_buffer_get_name(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    return "CPU-NUMA-Split";
+}
+
+GGML_CALL static void ggml_backend_cpu_numa_split_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_numa_split_buffer_context * ctx = (ggml_backend_cpu_numa_split_buffer_context *) buffer->context;
+    for (ggml_backend_buffer_t shard_buffer : ctx->shard_buffers) {
+        ggml_backend_buffer_free(shard_buffer);
+    }
+    delete ctx;
+}
+
+GGML_CALL static void * ggml_backend_cpu_numa_split_buffer_get_base(ggml_backend_buffer_t buffer) {
+    GGML_UNUSED(buffer);
+    return (void *) 0x1000;
+}
+
+GGML_CALL static void ggml_backend_cpu_numa_split_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->extra == nullptr) {
+        return;
+    }
+
+    ggml_backend_cpu_numa_split_buffer_context * ctx = (ggml_backend_cpu_numa_split_buffer_context *) buffer->context;
+    ggml_split_tensor_t * extra = (ggml_split_tensor_t *) tensor->extra;
+    GGML_ASSERT(extra->n_device <= (int) GGML_CPU_NUMA_MAX_NODES);
+
+    size_t total_size = 0;
+    for (int i = 0; i < extra->n_device; ++i) {
+        ggml_tensor * split = extra->splits[i];
+        if (split == nullptr) {
+            continue;
+        }
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_numa_buffer_type((uint32_t) i);
+        GGML_ASSERT(buft != nullptr);
+
+        const size_t shard_size = ggml_nbytes(split);
+        ggml_backend_buffer_t shard_buffer = ggml_backend_buft_alloc_buffer(buft, shard_size);
+        GGML_ASSERT(shard_buffer != nullptr);
+
+        split->buffer = shard_buffer;
+        split->data   = ggml_backend_buffer_get_base(shard_buffer);
+        ggml_backend_buffer_set_usage(shard_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ctx->shard_buffers.push_back(shard_buffer);
+
+        total_size += shard_size;
+        fprintf(stderr, "%s: allocated %zu bytes for %s shard %d on CPU-NUMA%d\n",
+                __func__, shard_size, tensor->name, i, i);
+    }
+
+    fprintf(stderr, "%s: allocated %zu bytes for split tensor %s across %d CPU-NUMA nodes\n",
+            __func__, total_size, tensor->name, extra->n_device);
+}
+
+GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_ABORT("%s: CPU-NUMA split tensor loading is not implemented yet", __func__);
+}
+
+GGML_CALL static void ggml_backend_cpu_numa_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
+    GGML_ABORT("%s: CPU-NUMA split tensor readback is not implemented yet", __func__);
+}
+
+GGML_CALL static void ggml_backend_cpu_numa_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);
+}
+
+static ggml_backend_buffer_i ggml_backend_cpu_numa_split_buffer_interface = {
+    /* .get_name        = */ ggml_backend_cpu_numa_split_buffer_get_name,
+    /* .free_buffer     = */ ggml_backend_cpu_numa_split_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cpu_numa_split_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cpu_numa_split_buffer_init_tensor,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_cpu_numa_split_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_numa_split_buffer_get_tensor,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_cpu_numa_split_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+GGML_CALL static const char * ggml_backend_cpu_numa_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "CPU-NUMA-Split";
+}
+
+GGML_CALL static ggml_backend_buffer_t ggml_backend_cpu_numa_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cpu_numa_split_buffer_context * ctx = new ggml_backend_cpu_numa_split_buffer_context();
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_numa_split_buffer_interface, ctx, size);
+}
+
+GGML_CALL static size_t ggml_backend_cpu_numa_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return TENSOR_ALIGNMENT;
+}
+
+GGML_CALL static size_t ggml_backend_cpu_numa_split_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    GGML_UNUSED(buft);
+    if (tensor->extra == nullptr) {
+        return 0;
+    }
+
+    ggml_split_tensor_t * extra = (ggml_split_tensor_t *) tensor->extra;
+    GGML_ASSERT(extra->n_device <= (int) GGML_CPU_NUMA_MAX_NODES);
+
+    size_t total_size = 0;
+    for (int i = 0; i < extra->n_device; ++i) {
+        if (extra->splits[i] != nullptr) {
+            total_size += ggml_nbytes(extra->splits[i]);
+        }
+    }
+    return total_size;
+}
+
+GGML_CALL static bool ggml_backend_cpu_numa_split_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
+
+static ggml_backend_buffer_type_i ggml_backend_cpu_numa_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cpu_numa_split_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cpu_numa_split_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_cpu_numa_split_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_cpu_numa_split_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_cpu_numa_split_buffer_type_is_host,
+};
+
+GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_split_buffer_type(void) {
+    static ggml_backend_buffer_type buft = {
+        /* .iface   = */ ggml_backend_cpu_numa_split_buffer_type_interface,
+        /* .context = */ NULL,
+    };
+    return &buft;
 }
 #endif
 
