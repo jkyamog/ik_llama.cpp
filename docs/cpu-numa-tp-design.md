@@ -557,7 +557,14 @@ unlikely.
 Follow-up test coverage now includes byte-exact Q8_0 split-buffer roundtrips
 for split dimensions 0, 1, and 2 in `tests/test-cpu-numa-tp.cpp`. That covers
 the simple 3D quantized split tensor copy paths used by Qwen MoE weights and
-passed under:
+passed. The same test file now also includes a scheduler-level Q8_0 MoE
+hidden-split check: it runs two CPU-NUMA `mul_mat_id` up/down shards over the
+FFN hidden dimension, reduces the shard outputs, and compares against a
+separate plain-CPU full-weight Q8_0 reference. With 32-wide hidden shards this
+passes within normal F32 accumulation-order tolerance, so the basic routed MoE
+hidden-dimension split/reduce algebra is not the Qwen122B failure by itself.
+
+These checks passed under:
 
 ```bash
 cmake --build build-debug-no-cuda --target llama-cli test-cpu-numa-tp -j4

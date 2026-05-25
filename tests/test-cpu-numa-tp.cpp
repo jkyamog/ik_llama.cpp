@@ -22,6 +22,18 @@ static void require_near(float got, float want, const char * msg) {
     }
 }
 
+static void require_near_tol(float got, float want, float tol, const char * msg) {
+    const float scale = std::max(1.0f, std::fabs(want));
+    if (std::fabs(got - want) > tol*scale) {
+        std::fprintf(stderr, "%s: got %.8f, want %.8f, tol %.8f\n", msg, got, want, tol);
+        std::exit(1);
+    }
+}
+
+static size_t idx3(int64_t i0, int64_t i1, int64_t i2, int64_t ne0, int64_t ne1) {
+    return (size_t) (i0 + i1*ne0 + i2*ne0*ne1);
+}
+
 static void roundtrip_split(int split_dim) {
 #ifndef __gnu_linux__
     (void) split_dim;
@@ -273,6 +285,185 @@ static void test_scheduler_reduce_on_numa_backends() {
 #endif
 }
 
+static void test_scheduler_moe_hidden_split() {
+#ifndef __gnu_linux__
+    std::puts("scheduler MoE split test skipped: non-Linux platform");
+#else
+    if (ggml_numa_node_count() == 0) {
+        ggml_numa_init(GGML_NUMA_STRATEGY_DISABLED);
+    }
+    if (!ggml_is_numa() || ggml_numa_node_count() < 2) {
+        std::puts("scheduler MoE split test skipped: fewer than two NUMA nodes");
+        return;
+    }
+
+    constexpr int64_t n_embd        = 32;
+    constexpr int64_t n_ff0         = 32;
+    constexpr int64_t n_ff1         = 32;
+    constexpr int64_t n_ff          = n_ff0 + n_ff1;
+    constexpr int64_t n_expert      = 3;
+    constexpr int64_t n_expert_used = 2;
+    constexpr int64_t n_tokens      = 2;
+    constexpr ggml_type weight_type = GGML_TYPE_Q8_0;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024*1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize ggml context");
+
+    ggml_tensor * x       = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+    ggml_tensor * ids     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * up0_w   = ggml_new_tensor_3d(ctx, weight_type, n_embd, n_ff0, n_expert);
+    ggml_tensor * up1_w   = ggml_new_tensor_3d(ctx, weight_type, n_embd, n_ff1, n_expert);
+    ggml_tensor * down0_w = ggml_new_tensor_3d(ctx, weight_type, n_ff0, n_embd, n_expert);
+    ggml_tensor * down1_w = ggml_new_tensor_3d(ctx, weight_type, n_ff1, n_embd, n_expert);
+
+    ggml_tensor * up0   = ggml_mul_mat_id(ctx, up0_w, x, ids);
+    ggml_tensor * down0 = ggml_mul_mat_id(ctx, down0_w, up0, ids);
+    ggml_tensor * up1   = ggml_mul_mat_id(ctx, up1_w, x, ids);
+    ggml_tensor * down1 = ggml_mul_mat_id(ctx, down1_w, up1, ids);
+    ggml_tensor * srcs[2] = { down0, down1 };
+    ggml_tensor * out = ggml_reduce(ctx, srcs, 2, GGML_OP_ADD);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_t backends[3] = {
+        ggml_backend_cpu_init_with_numa(0),
+        ggml_backend_cpu_init_with_numa(1),
+        ggml_backend_cpu_init(),
+    };
+    require(backends[0] && backends[1] && backends[2], "failed to initialize CPU-NUMA backends");
+
+    ggml_backend_buffer_type_t bufts[3] = {
+        ggml_backend_cpu_numa_buffer_type(0),
+        ggml_backend_cpu_numa_buffer_type(1),
+        ggml_backend_get_default_buffer_type(backends[2]),
+    };
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 3, GGML_DEFAULT_GRAPH_SIZE, true);
+    require(sched != nullptr, "failed to initialize scheduler");
+    ggml_backend_sched_set_split_mode_graph(sched, true, false);
+    ggml_backend_sched_set_tensor_backend(sched, up0_w,   backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, down0_w, backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, up0,     backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, down0,   backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, up1_w,   backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, down1_w, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, up1,     backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, down1,   backends[1]);
+    require(ggml_backend_sched_alloc_graph(sched, gf), "failed to allocate scheduler MoE split graph");
+
+    std::vector<float> xv(ggml_nelements(x));
+    for (size_t i = 0; i < xv.size(); ++i) {
+        xv[i] = 0.1f + 0.03f*(float) i;
+    }
+    const int32_t idv[n_expert_used*n_tokens] = {
+        0, 2,
+        1, 0,
+    };
+
+    std::vector<float> up0v(ggml_nelements(up0_w));
+    std::vector<float> up1v(ggml_nelements(up1_w));
+    std::vector<float> down0v(ggml_nelements(down0_w));
+    std::vector<float> down1v(ggml_nelements(down1_w));
+    std::vector<float> upv((size_t) n_embd*n_ff*n_expert);
+    std::vector<float> downv((size_t) n_ff*n_embd*n_expert);
+    for (size_t i = 0; i < up0v.size(); ++i)   up0v[i]   = 0.02f + 0.001f*(float) i;
+    for (size_t i = 0; i < up1v.size(); ++i)   up1v[i]   = 0.03f + 0.002f*(float) i;
+    for (size_t i = 0; i < down0v.size(); ++i) down0v[i] = 0.04f + 0.003f*(float) i;
+    for (size_t i = 0; i < down1v.size(); ++i) down1v[i] = 0.05f + 0.004f*(float) i;
+
+    for (int64_t ie = 0; ie < n_expert; ++ie) {
+        for (int64_t ih = 0; ih < n_ff0; ++ih) {
+            for (int64_t ic = 0; ic < n_embd; ++ic) {
+                upv[idx3(ic, ih, ie, n_embd, n_ff)] = up0v[idx3(ic, ih, ie, n_embd, n_ff0)];
+            }
+        }
+        for (int64_t ih = 0; ih < n_ff1; ++ih) {
+            for (int64_t ic = 0; ic < n_embd; ++ic) {
+                upv[idx3(ic, n_ff0 + ih, ie, n_embd, n_ff)] = up1v[idx3(ic, ih, ie, n_embd, n_ff1)];
+            }
+        }
+        for (int64_t io = 0; io < n_embd; ++io) {
+            for (int64_t ih = 0; ih < n_ff0; ++ih) {
+                downv[idx3(ih, io, ie, n_ff, n_embd)] = down0v[idx3(ih, io, ie, n_ff0, n_embd)];
+            }
+            for (int64_t ih = 0; ih < n_ff1; ++ih) {
+                downv[idx3(n_ff0 + ih, io, ie, n_ff, n_embd)] = down1v[idx3(ih, io, ie, n_ff1, n_embd)];
+            }
+        }
+    }
+
+    std::vector<uint8_t> up0q(ggml_nbytes(up0_w));
+    std::vector<uint8_t> up1q(ggml_nbytes(up1_w));
+    std::vector<uint8_t> down0q(ggml_nbytes(down0_w));
+    std::vector<uint8_t> down1q(ggml_nbytes(down1_w));
+    ggml_quantize_chunk(weight_type, up0v.data(),   up0q.data(),   0, ggml_nrows(up0_w),   up0_w->ne[0],   nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, up1v.data(),   up1q.data(),   0, ggml_nrows(up1_w),   up1_w->ne[0],   nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, down0v.data(), down0q.data(), 0, ggml_nrows(down0_w), down0_w->ne[0], nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, down1v.data(), down1q.data(), 0, ggml_nrows(down1_w), down1_w->ne[0], nullptr, nullptr);
+
+    ggml_backend_tensor_set(x,       xv.data(),     0, ggml_nbytes(x));
+    ggml_backend_tensor_set(ids,     idv,           0, ggml_nbytes(ids));
+    ggml_backend_tensor_set(up0_w,   up0q.data(),   0, ggml_nbytes(up0_w));
+    ggml_backend_tensor_set(up1_w,   up1q.data(),   0, ggml_nbytes(up1_w));
+    ggml_backend_tensor_set(down0_w, down0q.data(), 0, ggml_nbytes(down0_w));
+    ggml_backend_tensor_set(down1_w, down1q.data(), 0, ggml_nbytes(down1_w));
+
+    require(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS, "scheduler MoE split graph failed");
+
+    std::vector<float> got(ggml_nelements(out), 0.0f);
+    ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+
+    ggml_context * ctx_ref = ggml_init(params);
+    require(ctx_ref != nullptr, "failed to initialize reference ggml context");
+    ggml_tensor * x_ref     = ggml_new_tensor_3d(ctx_ref, GGML_TYPE_F32, n_embd, n_expert_used, n_tokens);
+    ggml_tensor * ids_ref   = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * up_w_ref  = ggml_new_tensor_3d(ctx_ref, weight_type, n_embd, n_ff, n_expert);
+    ggml_tensor * down_w_ref = ggml_new_tensor_3d(ctx_ref, weight_type, n_ff, n_embd, n_expert);
+    ggml_tensor * up_full   = ggml_mul_mat_id(ctx_ref, up_w_ref, x_ref, ids_ref);
+    ggml_tensor * ref_out   = ggml_mul_mat_id(ctx_ref, down_w_ref, up_full, ids_ref);
+    ggml_cgraph * gf_ref = ggml_new_graph(ctx_ref);
+    ggml_build_forward_expand(gf_ref, ref_out);
+
+    ggml_backend_t backend_ref = ggml_backend_cpu_init();
+    require(backend_ref != nullptr, "failed to initialize reference CPU backend");
+    ggml_backend_buffer_t buffer_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, backend_ref);
+    require(buffer_ref != nullptr, "failed to allocate reference CPU tensors");
+    std::vector<uint8_t> upq(ggml_nbytes(up_w_ref));
+    std::vector<uint8_t> downq(ggml_nbytes(down_w_ref));
+    ggml_quantize_chunk(weight_type, upv.data(),   upq.data(),   0, ggml_nrows(up_w_ref),   up_w_ref->ne[0],   nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, downv.data(), downq.data(), 0, ggml_nrows(down_w_ref), down_w_ref->ne[0], nullptr, nullptr);
+
+    ggml_backend_tensor_set(x_ref,      xv.data(),   0, ggml_nbytes(x_ref));
+    ggml_backend_tensor_set(ids_ref,    idv,         0, ggml_nbytes(ids_ref));
+    ggml_backend_tensor_set(up_w_ref,   upq.data(),  0, ggml_nbytes(up_w_ref));
+    ggml_backend_tensor_set(down_w_ref, downq.data(), 0, ggml_nbytes(down_w_ref));
+    require(ggml_backend_graph_compute(backend_ref, gf_ref) == GGML_STATUS_SUCCESS, "reference MoE graph failed");
+
+    std::vector<float> want(ggml_nelements(ref_out), 0.0f);
+    ggml_backend_tensor_get(ref_out, want.data(), 0, ggml_nbytes(ref_out));
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        require_near_tol(got[i], want[i], 1e-5f, "scheduler MoE hidden-split mismatch");
+    }
+
+    ggml_backend_buffer_free(buffer_ref);
+    ggml_backend_free(backend_ref);
+    ggml_free(ctx_ref);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backends[0]);
+    ggml_backend_free(backends[1]);
+    ggml_backend_free(backends[2]);
+    ggml_free(ctx);
+#endif
+}
+
 int main() {
     roundtrip_split(0);
     roundtrip_split(1);
@@ -282,6 +473,7 @@ int main() {
     roundtrip_split_bytes(GGML_TYPE_Q8_0, 2);
     test_reduce_add_cpu_backend();
     test_scheduler_reduce_on_numa_backends();
+    test_scheduler_moe_hidden_split();
     std::puts("cpu-numa-tp tests passed");
     return 0;
 }
