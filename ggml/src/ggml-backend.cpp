@@ -750,6 +750,9 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
 #ifdef __gnu_linux__
 static constexpr uint32_t GGML_CPU_NUMA_MAX_NODES = 8;
 
+// File-scoped array of CPU-NUMA buffer types for safe pointer comparison
+static ggml_backend_buffer_type_t ggml_backend_cpu_numa_buft_arr[GGML_CPU_NUMA_MAX_NODES] = {0};
+
 // NUMA node-specific buffer type for CPU tensor-parallel.
 struct ggml_backend_cpu_numa_buft_ctx {
     uint32_t numa_node;
@@ -775,11 +778,10 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(uint32_t 
     if (numa_node >= GGML_CPU_NUMA_MAX_NODES) {
         return nullptr;
     }
-    static ggml_backend_buffer_type_t buft_arr[GGML_CPU_NUMA_MAX_NODES] = {0};
     static std::mutex buft_mtx;
     std::lock_guard<std::mutex> lock(buft_mtx);
-    if (buft_arr[numa_node] != nullptr) {
-        return buft_arr[numa_node];
+    if (ggml_backend_cpu_numa_buft_arr[numa_node] != nullptr) {
+        return ggml_backend_cpu_numa_buft_arr[numa_node];
     }
     struct ggml_backend_cpu_numa_buft_ctx * ctx =
         (struct ggml_backend_cpu_numa_buft_ctx *)malloc(sizeof(struct ggml_backend_cpu_numa_buft_ctx));
@@ -799,7 +801,7 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(uint32_t 
     buft->iface.get_alloc_size = NULL;
     buft->iface.is_host = ggml_backend_cpu_buffer_type_is_host;
     buft->context = ctx;
-    buft_arr[numa_node] = buft;
+    ggml_backend_cpu_numa_buft_arr[numa_node] = buft;
     return buft;
 }
 #endif
@@ -1001,10 +1003,52 @@ GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const
     GGML_UNUSED(backend);
 }
 
-GGML_CALL static bool ggml_backend_cpu_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+#ifdef __gnu_linux__
+// Helper to check if a buffer type is a CPU-NUMA buffer type.
+// Uses pointer comparison against the known CPU-NUMA buffer type array.
+// This is safe because we compare the buft pointer itself, not its context.
+static bool ggml_backend_cpu_is_numa_buft(ggml_backend_buffer_type_t buft, int32_t * numa_node_out) {
+    if (buft == NULL) {
+        return false;
+    }
+    // Check against each known CPU-NUMA buffer type
+    for (uint32_t i = 0; i < GGML_CPU_NUMA_MAX_NODES; i++) {
+        if (buft == ggml_backend_cpu_numa_buft_arr[i]) {
+            if (numa_node_out != NULL) {
+                *numa_node_out = (int32_t)i;
+            }
+            return true;
+        }
+    }
+    return false;
+}
 
+#endif
+GGML_CALL static bool ggml_backend_cpu_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+#ifdef __gnu_linux__
+    struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    // Check if this is a CPU-NUMA buffer type using safe pointer comparison
+    int32_t buft_numa_node;
+    if (ggml_backend_cpu_is_numa_buft(buft, &buft_numa_node)) {
+        // CPU-NUMA buffer types must be matched to their owning NUMA backend
+        // CPU-NUMA0 backend (numa_node=0) supports CPU-NUMA0 buffers
+        // CPU-NUMA1 backend (numa_node=1) supports CPU-NUMA1 buffers
+        // Regular CPU backend (numa_node=-1) does NOT support CPU-NUMA buffers
+        if (cpu_ctx->numa_node < 0) {
+            // Fallback CPU backend cannot use CPU-NUMA buffers
+            return false;
+        }
+        return cpu_ctx->numa_node == buft_numa_node;
+    }
+    // Non-CPU-NUMA buffers: only fallback CPU backend (numa_node == -1) supports them
+    // CPU-NUMA backends should NOT claim generic CPU buffers - let fallback CPU handle them
+    return cpu_ctx->numa_node < 0 && ggml_backend_buft_is_host(buft);
+#else
     GGML_UNUSED(backend);
+    // Fallback for non-Linux: any host buffer type
+    return ggml_backend_buft_is_host(buft);
+#endif
 }
 
 static struct ggml_backend_i cpu_backend_i = {
