@@ -487,6 +487,10 @@ Server readiness on the Q4 model:
 - An uncommitted experiment that propagated the requested thread count into
   CPU-NUMA child backends made CPU-TP slower and could re-trigger the
   flash-attention assert, so it was not kept.
+- After FFN-only placement, a second uncommitted experiment that assigned each
+  CPU-NUMA child backend half of the requested threads improved prompt
+  throughput but dropped Q4 generation to about 13.5 tokens/s, so it was also
+  not kept.
 
 Current verdict:
 
