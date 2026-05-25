@@ -3404,6 +3404,15 @@ static bool llm_load_tensors(
         n_gpu_layers = 999;
     }
 
+    if (model.cpu_tp == 2) {
+        split_mode   = LLAMA_SPLIT_MODE_GRAPH;
+        n_gpu_layers = 999;
+        main_gpu     = 0;
+        max_gpu      = 0;
+        LLAMA_LOG_INFO("%s: CPU tensor-parallel selects split-mode graph across %u CPU-NUMA nodes\n",
+                __func__, model.cpu_node_count);
+    }
+
     model.split_mode   = split_mode;
     model.main_gpu     = main_gpu;
     model.max_gpu      = max_gpu;
@@ -6473,6 +6482,7 @@ struct llama_model * llama_model_load_from_file(
     ggml_time_init();
 
     llama_model * model = new llama_model;
+    model->cpu_tp = params.cpu_tp;
 
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
@@ -6496,20 +6506,33 @@ struct llama_model * llama_model_load_from_file(
         // disabled-equivalent with explicit log
         LLAMA_LOG_INFO("%s: CPU tensor-parallel is disabled (cpu_tp=1, no splitting)\n", __func__);
     } else if (params.cpu_tp == 2) {
-        // request two NUMA devices - minimal plumbing (Task 4)
+        // Request two CPU-NUMA devices for experimental CPU tensor parallelism.
+#ifdef __gnu_linux__
+        if (ggml_numa_node_count() == 0) {
+            ggml_numa_init(GGML_NUMA_STRATEGY_DISABLED);
+        }
         if (!ggml_is_numa()) {
             LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) requires NUMA with >1 nodes\n", __func__);
             delete model;
             return nullptr;
         }
-        // CPU-NUMA tensor parallelism needs split buffer placement and cross-node
-        // reduction before it can produce correct split tensor results.
-        LLAMA_LOG_ERROR("%s: --cpu-tp 2 is experimental and not available yet\n", __func__);
-        LLAMA_LOG_ERROR("%s: CPU-NUMA split buffer placement is not implemented\n", __func__);
-        LLAMA_LOG_ERROR("%s: CPU-NUMA cross-node reduction is not implemented\n", __func__);
-        LLAMA_LOG_ERROR("%s: use --cpu-tp 0 (default) or --cpu-tp 1 (disabled-equivalent)\n", __func__);
+        model->cpu_node_count = std::min<uint32_t>(2, ggml_numa_node_count());
+        if (model->cpu_node_count != 2) {
+            LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) requires exactly two usable NUMA nodes for v1; detected %u\n",
+                    __func__, model->cpu_node_count);
+            delete model;
+            return nullptr;
+        }
+        params.split_mode   = LLAMA_SPLIT_MODE_GRAPH;
+        params.n_gpu_layers = 999;
+        params.main_gpu     = 0;
+        params.max_gpu      = 0;
+        LLAMA_LOG_INFO("%s: enabling experimental CPU tensor-parallel across CPU-NUMA0 and CPU-NUMA1\n", __func__);
+#else
+        LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) is only supported on Linux\n", __func__);
         delete model;
         return nullptr;
+#endif
     } else if (params.cpu_tp != 0) {
         // Invalid value - should have been caught by CLI but handle here as safety
         LLAMA_LOG_ERROR("%s: invalid cpu_tp value: %d\n", __func__, params.cpu_tp);
