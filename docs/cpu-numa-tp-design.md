@@ -343,3 +343,99 @@ Platform and failure modes:
 - If fewer than two usable NUMA nodes are detected, CPU TP remains unavailable.
 - If a split tensor references more shards than available CPU-NUMA child buffer
   types, allocation fails early.
+
+## Validation Checkpoint 2026-05-25
+
+Implemented since Task B:
+
+- `--cpu-tp 2` now selects CPU-NUMA split-mode graph placement instead of
+  rejecting startup.
+- `CPU-NUMA-Split` allocates shard tensors on `CPU-NUMA0` and `CPU-NUMA1`
+  child buffer types.
+- CPU `GGML_OP_REDUCE` add is implemented for F32, F16, and BF16.
+- CPU-TP graph construction uses the full reduced activation as the next shard
+  input for CPU-TP, avoiding the GPU-oriented shortcut that reuses per-shard
+  reduce sources.
+- `tests/test-cpu-numa-tp.cpp` covers split-buffer set/get, CPU reduce-add,
+  and scheduler reduce-add on NUMA machines.
+
+Verified commands:
+
+```bash
+cmake --build build-debug-no-cuda --target llama-cli llama-server test-cpu-numa-tp -j4
+ctest --test-dir build-debug-no-cuda -R test-cpu-numa-tp --output-on-failure
+```
+
+Both passed.
+
+Tiny F32 model correctness:
+
+```bash
+build-debug-no-cuda/bin/llama-cli -m models/stories260K.gguf \
+  -p "Hello" -n 8 -s 42 -t 1 -tb 1 -ngl 0 --no-warmup --temp 0 --no-display-prompt
+
+build-debug-no-cuda/bin/llama-cli -m models/stories260K.gguf \
+  -p "Hello" -n 8 -s 42 -t 1 -tb 1 --cpu-tp 2 --no-warmup --temp 0 --no-display-prompt
+```
+
+Both generated:
+
+```text
+ was a big, red ball
+```
+
+The same fixed-thread comparison for prompt `a` generated:
+
+```text
+ little girl named Lily went
+```
+
+Fixed `-t 1 -tb 1` is required for a stable token-level comparison on this
+tiny model; the ordinary multithreaded CPU baseline can choose a different
+argmax token.
+
+Server startup smoke:
+
+```bash
+timeout 8s build-debug-no-cuda/bin/llama-server \
+  -m models/stories260K.gguf --cpu-tp 2 -t 1 -tb 1 \
+  --host 127.0.0.1 --port 18080 --no-warmup
+```
+
+The server loaded the model, initialized `CPU-NUMA0` and `CPU-NUMA1`, and
+reached `HTTP server listening` on `127.0.0.1:18080`.
+
+Quantized-model blocker:
+
+A larger quantized smoke model,
+`TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`
+`tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`, was downloaded to
+`models/perf/` for local validation. Baseline no-TP single-thread generation
+worked:
+
+```bash
+build-debug-no-cuda/bin/llama-cli \
+  -m models/perf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  -p "Once upon a time" -n 16 -s 42 -t 1 -tb 1 -ngl 0 \
+  --no-warmup --temp 0 --no-display-prompt
+```
+
+Generated:
+
+```text
+, there was a young woman named Lily. Lily was a kind and
+```
+
+The same model with `--cpu-tp 2` is not yet correct:
+
+- with default flash attention, it aborts in
+  `ggml/src/./iqk/fa/iqk_fa_templates.h:1157` with `GGML_ASSERT(S > 0)`;
+- with `--no-flash-attn`, it segfaults after model initialization and before
+  timings are printed.
+
+Current verdict:
+
+CPU-NUMA tensor parallelism is correct only for the narrow F32 tiny-model
+smoke. The branch is not ready for Task 12 performance claims or serving-config
+adoption because quantized-model CPU-TP execution still fails. Next work should
+debug the quantized split attention/KV-cache path before any benchmark decision.
