@@ -3,7 +3,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 static void require(bool ok, const char * msg) {
@@ -81,6 +83,72 @@ static void roundtrip_split(int split_dim) {
     for (size_t i = 0; i < in.size(); ++i) {
         require_near(out[i], in[i], "split-buffer roundtrip mismatch");
     }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+#endif
+}
+
+static void roundtrip_split_bytes(ggml_type type, int split_dim) {
+#ifndef __gnu_linux__
+    (void) type;
+    (void) split_dim;
+#else
+    const int64_t ne0 = 64;
+    const int64_t ne1 = 3;
+    const int64_t ne2 = 2;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 32*1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize ggml context");
+
+    ggml_tensor * parent = ggml_new_tensor_3d(ctx, type, ne0, ne1, ne2);
+    ggml_set_name(parent, "cpu_numa_split_bytes_test");
+
+    ggml_tensor * shards[2] = {};
+    if (split_dim == 0) {
+        shards[0] = ggml_new_tensor_3d(ctx, type, 32, ne1, ne2);
+        shards[1] = ggml_new_tensor_3d(ctx, type, 32, ne1, ne2);
+    } else if (split_dim == 1) {
+        shards[0] = ggml_new_tensor_3d(ctx, type, ne0, 1, ne2);
+        shards[1] = ggml_new_tensor_3d(ctx, type, ne0, 2, ne2);
+    } else if (split_dim == 2) {
+        shards[0] = ggml_new_tensor_3d(ctx, type, ne0, ne1, 1);
+        shards[1] = ggml_new_tensor_3d(ctx, type, ne0, ne1, 1);
+    } else {
+        require(false, "unsupported split dimension");
+    }
+
+    ggml_split_tensor_t split = {
+        /* .n_device  = */ 2,
+        /* .split_dim = */ split_dim,
+        /* .tensor    = */ parent,
+        /* .splits    = */ shards,
+    };
+    parent->extra = &split;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_numa_split_buffer_type();
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, parent));
+    require(buffer != nullptr, "failed to allocate CPU-NUMA split byte buffer");
+
+    parent->buffer = buffer;
+    parent->data = ggml_backend_buffer_get_base(buffer);
+    ggml_backend_buffer_init_tensor(buffer, parent);
+
+    std::vector<uint8_t> in(ggml_nbytes(parent));
+    for (size_t i = 0; i < in.size(); ++i) {
+        in[i] = (uint8_t) ((i * 37u + 13u) & 0xffu);
+    }
+
+    std::vector<uint8_t> out(in.size(), 0);
+    ggml_backend_tensor_set(parent, in.data(), 0, ggml_nbytes(parent));
+    ggml_backend_tensor_get(parent, out.data(), 0, ggml_nbytes(parent));
+
+    require(std::memcmp(out.data(), in.data(), in.size()) == 0, "split-buffer byte roundtrip mismatch");
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
@@ -209,6 +277,9 @@ int main() {
     roundtrip_split(0);
     roundtrip_split(1);
     roundtrip_split(2);
+    roundtrip_split_bytes(GGML_TYPE_Q8_0, 0);
+    roundtrip_split_bytes(GGML_TYPE_Q8_0, 1);
+    roundtrip_split_bytes(GGML_TYPE_Q8_0, 2);
     test_reduce_add_cpu_backend();
     test_scheduler_reduce_on_numa_backends();
     std::puts("cpu-numa-tp tests passed");

@@ -539,15 +539,30 @@ Follow-up diagnostics did not remove the mismatch:
 - `--no-offload-only-active-experts`, `-n 4`:
   `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-no-ooae-t96-n4.log`
   still generated ` аген2 human2` at about 2.09 tokens/s.
+- A temporary no-forced-async build, `-n 4`:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-no-forced-async-t96-n4.log`
+  still generated ` аген2 human2` at about 1.51 tokens/s.
 
 This rules out simple reduce precision, fused MoE up/gate, fused multi-add, and
-active-expert scheduling as the immediate explanation. The remaining blocker is
-in the generic split MoE graph semantics or CPU-NUMA split tensor execution for
-Qwen35MoE-shaped FFN/shared-expert layers. The code inspection point to keep in
-mind is `llm_build_moe_ffn()` in `src/llama-build-context.cpp`: routed experts
-and shared experts are split across the FFN hidden dimension, not the expert
-axis, so global expert IDs are still present on each shard. That makes a simple
-expert-index offset bug unlikely.
+active-expert scheduling as the immediate explanation. It also rules out the
+forced CPU-TP async scheduler override as the correctness cause. The remaining
+blocker is in the generic split MoE graph semantics or CPU-NUMA split tensor
+execution for Qwen35MoE-shaped FFN/shared-expert layers. The code inspection
+point to keep in mind is `llm_build_moe_ffn()` in
+`src/llama-build-context.cpp`: routed experts and shared experts are split
+across the FFN hidden dimension, not the expert axis, so global expert IDs are
+still present on each shard. That makes a simple expert-index offset bug
+unlikely.
+
+Follow-up test coverage now includes byte-exact Q8_0 split-buffer roundtrips
+for split dimensions 0, 1, and 2 in `tests/test-cpu-numa-tp.cpp`. That covers
+the simple 3D quantized split tensor copy paths used by Qwen MoE weights and
+passed under:
+
+```bash
+cmake --build build-debug-no-cuda --target llama-cli test-cpu-numa-tp -j4
+ctest --test-dir build-debug-no-cuda -R test-cpu-numa-tp --output-on-failure
+```
 
 Current verdict:
 
