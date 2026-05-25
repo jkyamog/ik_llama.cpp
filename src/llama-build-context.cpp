@@ -664,6 +664,10 @@ ggml_tensor * llm_build_context::llm_build_norm(
               llm_norm_type   type,
          const llm_build_cb & cb, int il, float scale_eps) {
 
+    if (type == LLM_NORM_RMS && cur->type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
+    }
+
     if (type == LLM_NORM_RMS && mw) {
         cur = ggml_fused_rms_norm(ctx, cur, mw, scale_eps * hparams.f_norm_rms_eps);
         if (mb) {

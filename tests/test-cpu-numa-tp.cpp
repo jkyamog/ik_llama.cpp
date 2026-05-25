@@ -212,6 +212,65 @@ static void test_reduce_add_cpu_backend() {
     ggml_free(ctx);
 }
 
+static void test_add_f32_half_broadcast(ggml_type rhs_type) {
+    require(rhs_type == GGML_TYPE_F16 || rhs_type == GGML_TYPE_BF16, "unexpected rhs type");
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024*1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize ggml context");
+
+    ggml_tensor * lhs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 3);
+    ggml_tensor * rhs = ggml_new_tensor_2d(ctx, rhs_type,      4, 1);
+    ggml_tensor * out = ggml_add(ctx, lhs, rhs);
+    require(out->type == GGML_TYPE_F32, "mixed add result type mismatch");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr, "failed to initialize CPU backend");
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr, "failed to allocate mixed add tensors");
+
+    std::vector<float> lhs_data(ggml_nelements(lhs));
+    for (size_t i = 0; i < lhs_data.size(); ++i) {
+        lhs_data[i] = 0.125f*(float) i - 1.0f;
+    }
+
+    const float rhs_data[4] = { 0.5f, -1.25f, 2.0f, 3.5f };
+    ggml_backend_tensor_set(lhs, lhs_data.data(), 0, ggml_nbytes(lhs));
+
+    if (rhs_type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> rhs_half(4);
+        ggml_fp32_to_fp16_row(rhs_data, rhs_half.data(), 4);
+        ggml_backend_tensor_set(rhs, rhs_half.data(), 0, ggml_nbytes(rhs));
+    } else {
+        std::vector<ggml_bf16_t> rhs_half(4);
+        ggml_fp32_to_bf16_row(rhs_data, rhs_half.data(), 4);
+        ggml_backend_tensor_set(rhs, rhs_half.data(), 0, ggml_nbytes(rhs));
+    }
+
+    require(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS, "mixed add graph failed");
+
+    std::vector<float> got(ggml_nelements(out), 0.0f);
+    ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+
+    for (int64_t i1 = 0; i1 < lhs->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < lhs->ne[0]; ++i0) {
+            const size_t i = idx2(i0, i1, lhs->ne[0]);
+            require_near_tol(got[i], lhs_data[i] + rhs_data[i0 % 4], 1e-3f, "mixed add broadcast mismatch");
+        }
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+}
+
 static void test_scheduler_reduce_on_numa_backends() {
 #ifndef __gnu_linux__
     std::puts("scheduler NUMA test skipped: non-Linux platform");
@@ -723,6 +782,8 @@ int main() {
     roundtrip_split_bytes(GGML_TYPE_Q8_0, 1);
     roundtrip_split_bytes(GGML_TYPE_Q8_0, 2);
     test_reduce_add_cpu_backend();
+    test_add_f32_half_broadcast(GGML_TYPE_F16);
+    test_add_f32_half_broadcast(GGML_TYPE_BF16);
     test_scheduler_reduce_on_numa_backends();
     test_scheduler_moe_hidden_split();
     test_scheduler_shared_expert_gate_split();

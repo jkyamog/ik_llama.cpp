@@ -12629,6 +12629,96 @@ static void ggml_compute_forward_add_f32(
     }
 }
 
+static void ggml_compute_forward_add_f32_f16(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr  = ggml_nrows(src0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT( nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        const int64_t i13 = i03 % ne13;
+        const int64_t i12 = i02 % ne12;
+        const int64_t i11 = i01 % ne11;
+        const int64_t nr0 = ne00 / ne10;
+
+        float * dst_ptr  = (float *) ((char *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1);
+        float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+
+        for (int64_t r = 0; r < nr0; ++r) {
+            for (int64_t i0 = 0; i0 < ne10; ++i0) {
+                const ggml_fp16_t * src1_ptr = (ggml_fp16_t *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + i0*nb10);
+                dst_ptr[r*ne10 + i0] = src0_ptr[r*ne10 + i0] + GGML_FP16_TO_FP32(*src1_ptr);
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_add_f32_bf16(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr  = ggml_nrows(src0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT( nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        const int64_t i13 = i03 % ne13;
+        const int64_t i12 = i02 % ne12;
+        const int64_t i11 = i01 % ne11;
+        const int64_t nr0 = ne00 / ne10;
+
+        float * dst_ptr  = (float *) ((char *) dst->data  + i03*nb3  + i02*nb2  + i01*nb1);
+        float * src0_ptr = (float *) ((char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
+
+        for (int64_t r = 0; r < nr0; ++r) {
+            for (int64_t i0 = 0; i0 < ne10; ++i0) {
+                const ggml_bf16_t * src1_ptr = (ggml_bf16_t *) ((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + i0*nb10);
+                dst_ptr[r*ne10 + i0] = src0_ptr[r*ne10 + i0] + GGML_BF16_TO_FP32(*src1_ptr);
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_add_f16_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -12971,6 +13061,12 @@ static void ggml_compute_forward_add(
             {
                 if (src1->type == GGML_TYPE_F32) {
                     ggml_compute_forward_add_f32(params, dst);
+                }
+                else if (src1->type == GGML_TYPE_F16) {
+                    ggml_compute_forward_add_f32_f16(params, dst);
+                }
+                else if (src1->type == GGML_TYPE_BF16) {
+                    ggml_compute_forward_add_f32_bf16(params, dst);
                 }
                 else {
                     GGML_ABORT("fatal error");
