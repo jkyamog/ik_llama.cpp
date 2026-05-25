@@ -865,22 +865,172 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_init_tensor(ggml_backen
             __func__, total_size, tensor->name, extra->n_device);
 }
 
+static void ggml_backend_cpu_numa_split_buffer_check_simple(const char * func, const ggml_tensor * tensor, size_t offset, size_t size) {
+    GGML_ASSERT(tensor->extra != nullptr);
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+
+    void * extra_ptr = nullptr;
+    memcpy(&extra_ptr, tensor->op_params, sizeof(extra_ptr));
+    if (extra_ptr != nullptr) {
+        GGML_ABORT("%s: CPU-NUMA split tensors with explicit ranges are not implemented yet", func);
+    }
+}
+
 GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    GGML_UNUSED(tensor);
-    GGML_UNUSED(data);
-    GGML_UNUSED(offset);
-    GGML_UNUSED(size);
-    GGML_ABORT("%s: CPU-NUMA split tensor loading is not implemented yet", __func__);
+
+    ggml_backend_cpu_numa_split_buffer_check_simple(__func__, tensor, offset, size);
+    ggml_split_tensor_t * extra = (ggml_split_tensor_t *) tensor->extra;
+    GGML_ASSERT(extra->n_device <= (int) GGML_CPU_NUMA_MAX_NODES);
+
+    if (extra->split_dim < 0) {
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(ggml_are_same_shape(tensor, split));
+            memcpy(split->data, data, ggml_nbytes(tensor));
+        }
+    } else if (extra->split_dim == 0) {
+        const ggml_type_traits_t tt = ggml_internal_get_type_traits(tensor->type);
+        if (tt.row_meta_size != 0) {
+            GGML_ABORT("%s: CPU-NUMA split_dim 0 with row metadata is not implemented yet", __func__);
+        }
+
+        int64_t ne0_acc = 0;
+        const int64_t nrows = ggml_nrows(tensor);
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(split->type == tensor->type);
+            GGML_ASSERT((int64_t) ggml_nrows(split) == nrows);
+            GGML_ASSERT(split->ne[0] % tt.blck_size == 0);
+            GGML_ASSERT(ne0_acc % tt.blck_size == 0);
+
+            const size_t src_offset = (ne0_acc / tt.blck_size) * tt.type_size;
+            const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+            for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
+                    const char * src = (const char *) data + i02*tensor->nb[2] + i01*tensor->nb[1] + src_offset;
+                    char       * dst = (char *) split->data + i02*split->nb[2] + i01*split->nb[1];
+                    memcpy(dst, src, split_row_size);
+                }
+            }
+            ne0_acc += split->ne[0];
+        }
+    } else if (extra->split_dim == 1) {
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        int64_t ne1_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(split->type == tensor->type);
+            GGML_ASSERT(split->ne[0] == tensor->ne[0]);
+            for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                const char * src = (const char *) data + i02*tensor->nb[2] + ne1_acc*tensor->nb[1];
+                char       * dst = (char *) split->data + i02*split->nb[2];
+                memcpy(dst, src, split->ne[1]*row_size);
+            }
+            ne1_acc += split->ne[1];
+        }
+    } else if (extra->split_dim == 2) {
+        int64_t ne2_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(split->type == tensor->type);
+            GGML_ASSERT(split->ne[0] == tensor->ne[0]);
+            GGML_ASSERT(split->ne[1] == tensor->ne[1]);
+            const char * src = (const char *) data + ne2_acc*tensor->nb[2];
+            memcpy(split->data, src, ggml_nbytes(split));
+            ne2_acc += split->ne[2];
+        }
+    } else {
+        GGML_ABORT("%s: unsupported CPU-NUMA split dimension %d", __func__, extra->split_dim);
+    }
 }
 
 GGML_CALL static void ggml_backend_cpu_numa_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    GGML_UNUSED(tensor);
-    GGML_UNUSED(data);
-    GGML_UNUSED(offset);
-    GGML_UNUSED(size);
-    GGML_ABORT("%s: CPU-NUMA split tensor readback is not implemented yet", __func__);
+
+    ggml_backend_cpu_numa_split_buffer_check_simple(__func__, tensor, offset, size);
+    ggml_split_tensor_t * extra = (ggml_split_tensor_t *) tensor->extra;
+    GGML_ASSERT(extra->n_device <= (int) GGML_CPU_NUMA_MAX_NODES);
+
+    if (extra->split_dim < 0) {
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            memcpy(data, split->data, ggml_nbytes(tensor));
+            return;
+        }
+        GGML_ABORT("%s: no CPU-NUMA shard holds replicated tensor %s", __func__, tensor->name);
+    } else if (extra->split_dim == 0) {
+        const ggml_type_traits_t tt = ggml_internal_get_type_traits(tensor->type);
+        if (tt.row_meta_size != 0) {
+            GGML_ABORT("%s: CPU-NUMA split_dim 0 with row metadata is not implemented yet", __func__);
+        }
+
+        int64_t ne0_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(split->ne[0] % tt.blck_size == 0);
+            GGML_ASSERT(ne0_acc % tt.blck_size == 0);
+
+            const size_t dst_offset = (ne0_acc / tt.blck_size) * tt.type_size;
+            const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+            for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
+                    const char * src = (const char *) split->data + i02*split->nb[2] + i01*split->nb[1];
+                    char       * dst = (char *) data + i02*tensor->nb[2] + i01*tensor->nb[1] + dst_offset;
+                    memcpy(dst, src, split_row_size);
+                }
+            }
+            ne0_acc += split->ne[0];
+        }
+    } else if (extra->split_dim == 1) {
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        int64_t ne1_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                const char * src = (const char *) split->data + i02*split->nb[2];
+                char       * dst = (char *) data + i02*tensor->nb[2] + ne1_acc*tensor->nb[1];
+                memcpy(dst, src, split->ne[1]*row_size);
+            }
+            ne1_acc += split->ne[1];
+        }
+    } else if (extra->split_dim == 2) {
+        int64_t ne2_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            ggml_tensor * split = extra->splits[i];
+            if (split == nullptr) {
+                continue;
+            }
+            char * dst = (char *) data + ne2_acc*tensor->nb[2];
+            memcpy(dst, split->data, ggml_nbytes(split));
+            ne2_acc += split->ne[2];
+        }
+    } else {
+        GGML_ABORT("%s: unsupported CPU-NUMA split dimension %d", __func__, extra->split_dim);
+    }
 }
 
 GGML_CALL static void ggml_backend_cpu_numa_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
