@@ -365,6 +365,7 @@ extern "C" {
         const char* devices;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM
+        int32_t cpu_tp;       // CPU tensor-parallel: 0=disabled (default), 1=disabled-equivalent with log, 2=request 2 NUMA devices (not yet implemented)
         int32_t mla;          // MLA implementation to use (only applicable to DeepSeek models at this point)
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 

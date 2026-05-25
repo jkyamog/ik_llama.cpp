@@ -6198,6 +6198,7 @@ struct llama_model_params llama_model_default_params() {
     struct llama_model_params result = {
         /*.devices                 =*/ nullptr,
         /*.n_gpu_layers                =*/ 0,
+        /*.cpu_tp                       =*/ 0,
         /*.mla                         =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
@@ -6406,6 +6407,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
     }
 }
 
+
 void llama_backend_free(void) {
     ggml_quantize_free();
 }
@@ -6443,6 +6445,22 @@ struct llama_model * llama_model_load_from_file(
         };
     }
     model->set_tensor_overrides(params);
+    // Handle CPU tensor-parallel option
+    if (params.cpu_tp == 1) {
+        // disabled-equivalent with explicit log
+        LLAMA_LOG_INFO("%s: CPU tensor-parallel is disabled (cpu_tp=1, no splitting)\n", __func__);
+    } else if (params.cpu_tp == 2) {
+        // request two NUMA devices - not yet implemented
+        LLAMA_LOG_ERROR("%s: CPU tensor-parallel with 2 NUMA devices requested (cpu_tp=2)\n", __func__);
+        LLAMA_LOG_ERROR("%s: ERROR: CPU NUMA TP backend plumbing not yet implemented (Task 4). This is an experimental feature.\n", __func__);
+        delete model;
+        return nullptr;
+    } else if (params.cpu_tp != 0) {
+        // Invalid value - should have been caught by CLI but handle here as safety
+        LLAMA_LOG_ERROR("%s: invalid cpu_tp value: %d\n", __func__, params.cpu_tp);
+        delete model;
+        return nullptr;
+    }
     // model->devices hold device indices that are used to offload
     // use model->devices to determine offload device
     // if no device is specified, all device are included

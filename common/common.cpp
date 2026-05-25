@@ -2109,6 +2109,28 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else { invalid_param = true; }
         return true;
     }
+    if (arg == "--cpu-tp") {
+        CHECK_ARG
+        int32_t value;
+        try {
+            value = std::stoi(argv[i]);
+        } catch (...) {
+            std::cerr << "error: --cpu-tp requires an integer value (0, 1, or 2)" << std::endl;
+            invalid_param = true;
+            return true;
+        }
+        if (value == 0) {
+            params.cpu_tp = 0; // disabled
+        } else if (value == 1) {
+            params.cpu_tp = 1; // disabled-equivalent with log
+        } else if (value == 2) {
+            params.cpu_tp = 2; // request two NUMA devices
+        } else {
+            std::cerr << "error: --cpu-tp value must be 0, 1, or 2, got: " << value << std::endl;
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3119,6 +3141,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - numactl: use the CPU map provided by numactl\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
+    options.push_back({ "*",           "       --cpu-tp N",             "experimental CPU tensor-parallel: 0=disabled (default), 1=disabled-equivalent with log, 2=request 2 NUMA devices" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -4037,6 +4060,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     if (params.n_gpu_layers != -1) {
         mparams.n_gpu_layers = params.n_gpu_layers;
     }
+    mparams.cpu_tp = params.cpu_tp;
     mparams.mla             = params.mla_attn;
     mparams.dry_run         = params.dry_run;
     mparams.rpc_servers     = params.rpc_servers.c_str();

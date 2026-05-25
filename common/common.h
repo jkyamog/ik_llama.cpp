@@ -301,6 +301,7 @@ struct gpt_params {
     void * cb_eval_user_data                 = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+    int32_t cpu_tp = 0; // CPU tensor-parallel: 0=disabled, 1=disabled-equivalent with log, 2=request 2 NUMA devices
 
     enum llama_split_mode        split_mode        = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
