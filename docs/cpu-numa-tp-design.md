@@ -505,13 +505,56 @@ Server readiness on the Q4 model:
   point among 1, 2, 4, 8, and 16 threads. Eight threads improved prompt
   throughput but reduced generation throughput.
 
+Representative Qwen 122B MoE gate:
+
+The representative large-model gate used
+`/mnt/storage/models/qwen3.5-122b-a10b-mtp-ud-q8_k_xl/UD-Q8_K_XL/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf`
+with prompt `Hello`, seed 42, `-t 96 -tb 96 -c 2048 -b 128 -ub 128`,
+`--no-warmup --temp 0 --no-display-prompt`.
+
+Baseline ordinary CPU:
+
+- Log: `/tmp/cpu-numa-tp-logs/qwen122b-q8-baseline-cpu-t96-n8.log`
+- Output for `-n 8`: `, I am a 20 year`
+- Load time: about 224 s
+- Generation: about 3.43 tokens/s
+
+CPU-TP after first-touch:
+
+- Log: `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-t96-n8.log`
+- Output for `-n 8`: ` аген2 human232)0`
+- Load time: about 382 s
+- Generation: about 2.44 tokens/s
+- Graph splits: 175
+- `CPU-NUMA-Split` buffer: about 120420 MiB
+
+Follow-up diagnostics did not remove the mismatch:
+
+- `--graph-reduce-type f32`, `-n 4`:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-grtf32-t96-n4.log`
+  still generated ` аген2 human2` at about 2.12 tokens/s.
+- `-no-fmoe -no-mmad`, `-n 4`:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-no-fmoe-no-mmad-t96-n4.log`
+  still generated ` аген2 human2` at about 2.05 tokens/s.
+- `--no-offload-only-active-experts`, `-n 4`:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-no-ooae-t96-n4.log`
+  still generated ` аген2 human2` at about 2.09 tokens/s.
+
+This rules out simple reduce precision, fused MoE up/gate, fused multi-add, and
+active-expert scheduling as the immediate explanation. The remaining blocker is
+in the generic split MoE graph semantics or CPU-NUMA split tensor execution for
+Qwen35MoE-shaped FFN/shared-expert layers. The code inspection point to keep in
+mind is `llm_build_moe_ffn()` in `src/llama-build-context.cpp`: routed experts
+and shared experts are split across the FFN hidden dimension, not the expert
+axis, so global expert IDs are still present on each shard. That makes a simple
+expert-index offset bug unlikely.
+
 Current verdict:
 
-CPU-NUMA tensor parallelism now has narrow CLI correctness evidence for F32 and
-Q4 smoke models, including `--no-flash-attn`, and the Q4 server path can start
-and answer a request. It is still not ready for Task 12 performance claims or
-serving-config adoption. FFN-only placement plus CPU-NUMA buffer first-touch
-makes the implementation stable and much closer to baseline generation speed,
-but the local Q4 smoke remains slower than baseline overall. Next work should
-either find a CPU-TP scheduling/threading design that closes the remaining gap
-or stop this spike as not performance-useful.
+CPU-NUMA tensor parallelism has narrow CLI correctness evidence for F32 and Q4
+smoke models, including `--no-flash-attn`, and the Q4 server path can start and
+answer a request. It is not ready for Task 12 performance claims or
+serving-config adoption. On the representative Qwen35MoE 122B Q8 model,
+CPU-TP is both semantically wrong and slower than baseline. Next work must
+either find and fix the split-MoE correctness issue, or stop this spike as not
+correctness-safe for the target workload.
