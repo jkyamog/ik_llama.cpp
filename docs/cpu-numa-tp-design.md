@@ -171,3 +171,103 @@ Next tasks before split/reduction:
 - Use CPU-NUMA buffer types for CPU-NUMA scheduler compute buffers.
 
 Do not proceed to split tensor compute/reduction or performance tests until these are fixed and representative tensor placement is auditable.
+
+## Task A: Split-Buffer Contract Map
+
+Verdict: the generic split tensor model is reusable for CPU-NUMA, but the
+existing reduction path is not sufficient for CPU today. CPU-NUMA needs a real
+split buffer type plus a CPU implementation or CPU-specific hook for
+`GGML_OP_REDUCE` add before `--cpu-tp 2` can be made correct.
+
+Required split buffer callbacks and behavior:
+
+- `ggml_backend_buffer_type_i::get_name`: expose a distinct parent split buffer
+  type name such as `CPU-NUMA-Split`.
+- `ggml_backend_buffer_type_i::alloc_buffer`: create the parent logical split
+  buffer. Like CUDA, this buffer does not allocate one contiguous backing store
+  for all shards; shard allocation happens per tensor during `init_tensor`.
+- `ggml_backend_buffer_type_i::get_alignment`: return an alignment compatible
+  with CPU tensor allocation.
+- `ggml_backend_buffer_type_i::get_alloc_size`: sum the allocation sizes of all
+  present shard tensors from `ggml_split_tensor_t::splits`.
+- `ggml_backend_buffer_type_i::is_host`: the parent split buffer should not be
+  reported as a plain host buffer, otherwise split-mode loading skips it through
+  the existing host-buffer guard.
+- `ggml_backend_buffer_i::get_base`: return a dummy non-null address for the
+  logical parent, matching the CUDA split buffer pattern.
+- `ggml_backend_buffer_i::init_tensor`: inspect `tensor->extra` as
+  `ggml_split_tensor_t`, allocate each shard tensor on the matching
+  `CPU-NUMA<i>` child buffer type, set `split->data`, set `split->buffer`, and
+  mark shard buffers as weight buffers.
+- `ggml_backend_buffer_i::set_tensor`: load an entire logical split tensor at
+  offset 0, dispatching bytes into per-node shard tensors according to
+  `split_dim`. It must support the same narrow forms needed by the first tensor
+  family under test before it is generalized.
+- `ggml_backend_buffer_i::get_tensor`: only needed for diagnostics and parity
+  checks at first. It can be implemented for simple contiguous split forms and
+  abort for repacked or explicit-range layouts until those are required.
+- `ggml_backend_buffer_i::clear`: may be a no-op for weight buffers.
+
+Required metadata and ownership rules:
+
+- Split structure is generic: `ggml_split_tensor_t` in `ggml/include/ggml.h`
+  carries `n_device`, `split_dim`, and the per-device `splits` array.
+- llama owns the lifetime of `llama_split_tensor::tensor_splits`; the logical
+  parent tensor stores `tensor->extra = &split_tensor.ggml`.
+- The parent logical tensor is allocated in a split buffer type. Each child
+  shard tensor must be allocated in a node-specific `CPU-NUMA<i>` child buffer
+  type so scheduler buffer ownership resolves to the matching CPU-node backend.
+- `CPU-NUMA<i>` backends may support only their matching node buffer type.
+  Fallback `CPU` must not claim CPU-NUMA child buffers ahead of the owner.
+- Default CPU buffers remain unchanged when `--cpu-tp` is disabled.
+
+Exact creation and loading symbols:
+
+- `ggml/include/ggml.h`: `ggml_split_tensor_t` defines split metadata.
+- `ggml/src/ggml-cuda.cu`: `ggml_backend_cuda_split_buffer_*` is the reference
+  contract for split parent allocation, per-shard child allocation, tensor load,
+  and aggregate allocation sizing.
+- `ggml/include/ggml-cuda.h` and `ggml/include/ggml-sycl.h`: public split buffer
+  type factories are `ggml_backend_cuda_split_buffer_type()` and
+  `ggml_backend_sycl_split_buffer_type()`.
+- `src/llama.cpp`: `llama_default_buffer_type_split()` chooses CUDA/SYCL split
+  buffers and needs the CPU-NUMA split-buffer branch.
+- `src/llama-load-tensors.cpp`: `prepare_split_tensors()` creates shard tensor
+  metadata and attaches it to the logical tensor.
+- `src/llama-load-tensors.cpp`: split-mode graph setup prepares attention, FFN,
+  MoE, and output tensor shard metadata after layer tensor creation.
+
+Scheduler and execution expectations:
+
+- `ggml_backend_sched_new()` receives one backend and compute buffer type per
+  scheduler target.
+- `ggml_backend_sched_backend_from_buffer()` and backend `supports_buft` decide
+  tensor ownership from the buffer type.
+- `ggml_backend_sched_split_graph()` treats `GGML_OP_REDUCE`, `GGML_OP_FAKE_CPY`,
+  and marked nodes as split boundaries.
+- Split-mode graph scheduling is enabled from `src/llama.cpp` through
+  `ggml_backend_sched_set_split_mode_graph()` when the model is in
+  `LLAMA_SPLIT_MODE_GRAPH`.
+- CPU-NUMA shard matmuls should run on the backend that owns the shard buffer,
+  with `ggml_cplan::numa_node` pinning worker threads to that node.
+
+Reduction path finding:
+
+- `ggml_reduce()` in `ggml/src/ggml.c` creates a `GGML_OP_REDUCE` node with
+  `GGML_OP_ADD` in `op_params[0]`.
+- Split graph builders emit this reduce for split attention, dense FFN, and MoE
+  FFN paths in `src/llama-build-context.cpp`.
+- CUDA supports `GGML_OP_REDUCE` through `ggml_cuda_op_reduce()` and advertises
+  support in `ggml_backend_cuda_supports_op()`.
+- CPU backend currently advertises default support for most ops, but CPU compute
+  aborts on `GGML_OP_REDUCE` in `ggml/src/ggml.c`. This means CPU-NUMA cannot
+  rely on the existing reduce node until CPU reduce-add is implemented or the
+  scheduler routes reduce to a backend that can perform it correctly.
+
+Decision:
+
+CPU-NUMA should reuse the generic split tensor metadata, llama split tensor
+creation, and scheduler split-mode graph machinery. It still needs a CPU-NUMA
+split buffer type and a CPU reduce-add path. Do not remove the `--cpu-tp 2`
+startup rejection until both are present and a deterministic correctness test
+passes.
