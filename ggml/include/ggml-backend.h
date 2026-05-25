@@ -105,6 +105,7 @@ extern "C" {
 #ifdef __gnu_linux__
     GGML_API           ggml_backend_t ggml_backend_cpu_init_with_numa(int32_t numa_node);
     GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_numa_buffer_type(uint32_t numa_node);
+    GGML_API GGML_CALL int32_t ggml_backend_cpu_get_numa_node(ggml_backend_t backend);
 #endif
     GGML_API           void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 

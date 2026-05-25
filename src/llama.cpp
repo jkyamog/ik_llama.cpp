@@ -7205,8 +7205,19 @@ struct llama_context * llama_init_from_model(
             std::vector<ggml_backend_buffer_type_t> backend_buft;
             for (auto * backend : ctx->backends) {
                 if (ggml_backend_is_cpu(backend)) {
-                    // use host buffers for the CPU backend compute buffer
+#ifdef __gnu_linux__
+                    // CPU-NUMA backends get their matching CPU-NUMA buffer type,
+                    // fallback CPU backend keeps generic CPU buffer type
+                    int32_t numa_node = ggml_backend_cpu_get_numa_node(backend);
+                    if (numa_node >= 0) {
+                        backend_buft.push_back(ggml_backend_cpu_numa_buffer_type((uint32_t)numa_node));
+                    } else {
+                        backend_buft.push_back(llama_default_buffer_type_cpu(true));
+                    }
+#else
+                    // Non-Linux: all CPU backends use generic CPU buffer type
                     backend_buft.push_back(llama_default_buffer_type_cpu(true));
+#endif
                 } else {
                     backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
                 }

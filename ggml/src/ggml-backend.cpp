@@ -1128,6 +1128,12 @@ ggml_backend_t ggml_backend_cpu_init_with_numa(int32_t numa_node) {
     }
     return backend;
 }
+
+GGML_CALL int32_t ggml_backend_cpu_get_numa_node(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend));
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend->context;
+    return ctx->numa_node;
+}
 #endif
 void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data) {
     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
