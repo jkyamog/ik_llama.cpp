@@ -672,6 +672,26 @@ and only about 52 s slower to load in this local sample. This makes the
 representative CLI gate much closer to adoption-ready, but the server path
 still needs a deliberate validation run before changing serving config.
 
+Representative Qwen122B CPU-TP server validation:
+
+- Command shape:
+  `llama-server -m <Qwen122B Q8 split GGUF> -t 96 -tb 96 -c 2048 -b 128 -ub 128 --no-warmup --temp 0 --cpu-tp 2 --host 127.0.0.1 --port 18080 --log-format text`
+- Server log:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-copy-firsttouch-t96-p18080.log`
+- Completion response:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-copy-firsttouch-completion-response.json`
+- Build: `fd122715`
+- Startup: model load began at log timestamp `1779720398`; `model loaded` and
+  `HTTP server listening` were logged at `1779720625`, about 227 s later.
+- Request: `POST /completion` with prompt `Hello`, `n_predict: 8`,
+  `temperature: 0`, `seed: 42`, and `cache_prompt: false`.
+- Response content: `, I am a 20 year`
+- Server timing: prompt eval 340.12 ms / 1 token, eval 1540.46 ms / 8 tokens,
+  about 5.19 tokens/s.
+
+This validates the representative Qwen server path without changing Docker or
+the active serving config.
+
 Dense Q4 guard after the split-buffer load change:
 
 - Log: `/tmp/cpu-numa-tp-logs/cputp-q4-copy-firsttouch-t52-n16.log`
@@ -690,11 +710,13 @@ git diff --check
 Current verdict:
 
 CPU-NUMA tensor parallelism has narrow CLI correctness evidence for F32 and Q4
-smoke models, including `--no-flash-attn`, and the Q4 server path can start and
-answer a request. The representative Qwen35MoE 122B Q8 short gate now matches
-the ordinary CPU baseline prefix after fixing split FFN norm handling. A
-MoE-only CPU-NUMA child thread heuristic now clears the representative Task H
-generation-throughput target on the apples-to-apples `-n 8` gate, and
-copy-as-first-touch split loading narrows the large load-time penalty
-substantially. Next work should be a deliberate server validation and
-deployment decision rather than more CLI correctness debugging.
+smoke models, including `--no-flash-attn`; the Q4 server path can start and
+answer a request; and the representative Qwen35MoE 122B Q8 server path now
+starts and serves the baseline-matching short completion. The representative
+Qwen35MoE 122B Q8 short gate matches the ordinary CPU baseline prefix after
+fixing split FFN norm handling. A MoE-only CPU-NUMA child thread heuristic
+clears the representative Task H generation-throughput target on the
+apples-to-apples `-n 8` CLI gate, and copy-as-first-touch split loading narrows
+the large load-time penalty substantially. The implementation is ready for a
+user go/no-go decision about deploying the experimental `--cpu-tp 2` serving
+config; no active serving config has been changed in this spike.
