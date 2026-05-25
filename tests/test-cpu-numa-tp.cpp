@@ -34,6 +34,10 @@ static size_t idx3(int64_t i0, int64_t i1, int64_t i2, int64_t ne0, int64_t ne1)
     return (size_t) (i0 + i1*ne0 + i2*ne0*ne1);
 }
 
+static size_t idx2(int64_t i0, int64_t i1, int64_t ne0) {
+    return (size_t) (i0 + i1*ne0);
+}
+
 static void roundtrip_split(int split_dim) {
 #ifndef __gnu_linux__
     (void) split_dim;
@@ -464,6 +468,253 @@ static void test_scheduler_moe_hidden_split() {
 #endif
 }
 
+static void test_scheduler_shared_expert_gate_split() {
+#ifndef __gnu_linux__
+    std::puts("scheduler shared-expert split test skipped: non-Linux platform");
+#else
+    if (ggml_numa_node_count() == 0) {
+        ggml_numa_init(GGML_NUMA_STRATEGY_DISABLED);
+    }
+    if (!ggml_is_numa() || ggml_numa_node_count() < 2) {
+        std::puts("scheduler shared-expert split test skipped: fewer than two NUMA nodes");
+        return;
+    }
+
+    constexpr int64_t n_embd   = 32;
+    constexpr int64_t n_ff0    = 32;
+    constexpr int64_t n_ff1    = 32;
+    constexpr int64_t n_ff     = n_ff0 + n_ff1;
+    constexpr int64_t n_tokens = 3;
+    constexpr ggml_type weight_type = GGML_TYPE_Q8_0;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024*1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr, "failed to initialize ggml context");
+
+    ggml_tensor * x          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * routed_w   = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_embd);
+    ggml_tensor * gate0_w    = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_ff0);
+    ggml_tensor * gate1_w    = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_ff1);
+    ggml_tensor * up0_w      = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_ff0);
+    ggml_tensor * up1_w      = ggml_new_tensor_2d(ctx, weight_type, n_embd, n_ff1);
+    ggml_tensor * down0_w    = ggml_new_tensor_2d(ctx, weight_type, n_ff0, n_embd);
+    ggml_tensor * down1_w    = ggml_new_tensor_2d(ctx, weight_type, n_ff1, n_embd);
+    ggml_tensor * shexp0_w   = ggml_new_tensor_2d(ctx, weight_type, n_embd, 1);
+    ggml_tensor * shexp1_w   = ggml_new_tensor_2d(ctx, weight_type, n_embd, 1);
+
+    ggml_tensor * routed = ggml_mul_mat(ctx, routed_w, x);
+    ggml_tensor * up0    = ggml_mul_mat(ctx, up0_w, x);
+    ggml_tensor * gate0  = ggml_mul_mat(ctx, gate0_w, x);
+    ggml_tensor * silu0  = ggml_silu(ctx, gate0);
+    ggml_tensor * hid0   = ggml_mul(ctx, silu0, up0);
+    ggml_tensor * down0  = ggml_mul_mat(ctx, down0_w, hid0);
+    ggml_tensor * sg0    = ggml_mul_mat(ctx, shexp0_w, x);
+    ggml_tensor * sig0   = ggml_sigmoid(ctx, sg0);
+    ggml_tensor * gated0 = ggml_mul(ctx, down0, sig0);
+    ggml_tensor * out0   = ggml_add(ctx, gated0, routed);
+
+    ggml_tensor * up1    = ggml_mul_mat(ctx, up1_w, x);
+    ggml_tensor * gate1  = ggml_mul_mat(ctx, gate1_w, x);
+    ggml_tensor * silu1  = ggml_silu(ctx, gate1);
+    ggml_tensor * hid1   = ggml_mul(ctx, silu1, up1);
+    ggml_tensor * down1  = ggml_mul_mat(ctx, down1_w, hid1);
+    ggml_tensor * sg1    = ggml_mul_mat(ctx, shexp1_w, x);
+    ggml_tensor * sig1   = ggml_sigmoid(ctx, sg1);
+    ggml_tensor * out1   = ggml_mul(ctx, down1, sig1);
+
+    ggml_tensor * srcs[2] = { out0, out1 };
+    ggml_tensor * out = ggml_reduce(ctx, srcs, 2, GGML_OP_ADD);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_t backends[3] = {
+        ggml_backend_cpu_init_with_numa(0),
+        ggml_backend_cpu_init_with_numa(1),
+        ggml_backend_cpu_init(),
+    };
+    require(backends[0] && backends[1] && backends[2], "failed to initialize CPU-NUMA backends");
+
+    ggml_backend_buffer_type_t bufts[3] = {
+        ggml_backend_cpu_numa_buffer_type(0),
+        ggml_backend_cpu_numa_buffer_type(1),
+        ggml_backend_get_default_buffer_type(backends[2]),
+    };
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 3, GGML_DEFAULT_GRAPH_SIZE, true);
+    require(sched != nullptr, "failed to initialize scheduler");
+    ggml_backend_sched_set_split_mode_graph(sched, true, false);
+    ggml_backend_sched_set_tensor_backend(sched, routed_w, backends[2]);
+    ggml_backend_sched_set_tensor_backend(sched, routed,   backends[2]);
+    ggml_backend_sched_set_tensor_backend(sched, gate0_w,  backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, up0_w,    backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, down0_w,  backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, shexp0_w, backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, up0,      backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, gate0,    backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, silu0,    backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, hid0,     backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, down0,    backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, sg0,      backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, sig0,     backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, gated0,   backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, out0,     backends[0]);
+    ggml_backend_sched_set_tensor_backend(sched, gate1_w,  backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, up1_w,    backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, down1_w,  backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, shexp1_w, backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, up1,      backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, gate1,    backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, silu1,    backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, hid1,     backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, down1,    backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, sg1,      backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, sig1,     backends[1]);
+    ggml_backend_sched_set_tensor_backend(sched, out1,     backends[1]);
+    require(ggml_backend_sched_alloc_graph(sched, gf), "failed to allocate scheduler shared-expert split graph");
+
+    std::vector<float> xv(ggml_nelements(x));
+    for (size_t i = 0; i < xv.size(); ++i) {
+        xv[i] = 0.03f + 0.01f*(float) i;
+    }
+    std::vector<float> routedv(ggml_nelements(routed_w));
+    std::vector<float> gate0v(ggml_nelements(gate0_w));
+    std::vector<float> gate1v(ggml_nelements(gate1_w));
+    std::vector<float> up0v(ggml_nelements(up0_w));
+    std::vector<float> up1v(ggml_nelements(up1_w));
+    std::vector<float> down0v(ggml_nelements(down0_w));
+    std::vector<float> down1v(ggml_nelements(down1_w));
+    std::vector<float> shexpv(ggml_nelements(shexp0_w));
+    std::vector<float> gatev((size_t) n_embd*n_ff);
+    std::vector<float> upv((size_t) n_embd*n_ff);
+    std::vector<float> downv((size_t) n_ff*n_embd);
+    for (size_t i = 0; i < routedv.size(); ++i) routedv[i] = 0.001f + 0.0001f*(float) i;
+    for (size_t i = 0; i < gate0v.size(); ++i)  gate0v[i]  = 0.002f + 0.0002f*(float) i;
+    for (size_t i = 0; i < gate1v.size(); ++i)  gate1v[i]  = 0.003f + 0.0003f*(float) i;
+    for (size_t i = 0; i < up0v.size(); ++i)    up0v[i]    = 0.004f + 0.0004f*(float) i;
+    for (size_t i = 0; i < up1v.size(); ++i)    up1v[i]    = 0.005f + 0.0005f*(float) i;
+    for (size_t i = 0; i < down0v.size(); ++i)  down0v[i]  = 0.006f + 0.0006f*(float) i;
+    for (size_t i = 0; i < down1v.size(); ++i)  down1v[i]  = 0.007f + 0.0007f*(float) i;
+    for (size_t i = 0; i < shexpv.size(); ++i)  shexpv[i]  = -0.01f + 0.0005f*(float) i;
+
+    for (int64_t ih = 0; ih < n_ff0; ++ih) {
+        for (int64_t ic = 0; ic < n_embd; ++ic) {
+            gatev[idx2(ic, ih, n_embd)] = gate0v[idx2(ic, ih, n_embd)];
+            upv[idx2(ic, ih, n_embd)]   = up0v[idx2(ic, ih, n_embd)];
+        }
+    }
+    for (int64_t ih = 0; ih < n_ff1; ++ih) {
+        for (int64_t ic = 0; ic < n_embd; ++ic) {
+            gatev[idx2(ic, n_ff0 + ih, n_embd)] = gate1v[idx2(ic, ih, n_embd)];
+            upv[idx2(ic, n_ff0 + ih, n_embd)]   = up1v[idx2(ic, ih, n_embd)];
+        }
+    }
+    for (int64_t io = 0; io < n_embd; ++io) {
+        for (int64_t ih = 0; ih < n_ff0; ++ih) {
+            downv[idx2(ih, io, n_ff)] = down0v[idx2(ih, io, n_ff0)];
+        }
+        for (int64_t ih = 0; ih < n_ff1; ++ih) {
+            downv[idx2(n_ff0 + ih, io, n_ff)] = down1v[idx2(ih, io, n_ff1)];
+        }
+    }
+
+    std::vector<uint8_t> routedq(ggml_nbytes(routed_w));
+    std::vector<uint8_t> gate0q(ggml_nbytes(gate0_w));
+    std::vector<uint8_t> gate1q(ggml_nbytes(gate1_w));
+    std::vector<uint8_t> up0q(ggml_nbytes(up0_w));
+    std::vector<uint8_t> up1q(ggml_nbytes(up1_w));
+    std::vector<uint8_t> down0q(ggml_nbytes(down0_w));
+    std::vector<uint8_t> down1q(ggml_nbytes(down1_w));
+    std::vector<uint8_t> shexpq(ggml_nbytes(shexp0_w));
+    ggml_quantize_chunk(weight_type, routedv.data(), routedq.data(), 0, ggml_nrows(routed_w), routed_w->ne[0], nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, gate0v.data(),  gate0q.data(),  0, ggml_nrows(gate0_w),  gate0_w->ne[0],  nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, gate1v.data(),  gate1q.data(),  0, ggml_nrows(gate1_w),  gate1_w->ne[0],  nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, up0v.data(),    up0q.data(),    0, ggml_nrows(up0_w),    up0_w->ne[0],    nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, up1v.data(),    up1q.data(),    0, ggml_nrows(up1_w),    up1_w->ne[0],    nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, down0v.data(),  down0q.data(),  0, ggml_nrows(down0_w),  down0_w->ne[0],  nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, down1v.data(),  down1q.data(),  0, ggml_nrows(down1_w),  down1_w->ne[0],  nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, shexpv.data(),  shexpq.data(),  0, ggml_nrows(shexp0_w), shexp0_w->ne[0], nullptr, nullptr);
+
+    ggml_backend_tensor_set(x,        xv.data(),      0, ggml_nbytes(x));
+    ggml_backend_tensor_set(routed_w, routedq.data(), 0, ggml_nbytes(routed_w));
+    ggml_backend_tensor_set(gate0_w,  gate0q.data(),  0, ggml_nbytes(gate0_w));
+    ggml_backend_tensor_set(gate1_w,  gate1q.data(),  0, ggml_nbytes(gate1_w));
+    ggml_backend_tensor_set(up0_w,    up0q.data(),    0, ggml_nbytes(up0_w));
+    ggml_backend_tensor_set(up1_w,    up1q.data(),    0, ggml_nbytes(up1_w));
+    ggml_backend_tensor_set(down0_w,  down0q.data(),  0, ggml_nbytes(down0_w));
+    ggml_backend_tensor_set(down1_w,  down1q.data(),  0, ggml_nbytes(down1_w));
+    ggml_backend_tensor_set(shexp0_w, shexpq.data(),  0, ggml_nbytes(shexp0_w));
+    ggml_backend_tensor_set(shexp1_w, shexpq.data(),  0, ggml_nbytes(shexp1_w));
+
+    require(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS, "scheduler shared-expert split graph failed");
+
+    std::vector<float> got(ggml_nelements(out), 0.0f);
+    ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+
+    ggml_context * ctx_ref = ggml_init(params);
+    require(ctx_ref != nullptr, "failed to initialize reference ggml context");
+    ggml_tensor * x_ref       = ggml_new_tensor_2d(ctx_ref, GGML_TYPE_F32, n_embd, n_tokens);
+    ggml_tensor * routed_ref_w = ggml_new_tensor_2d(ctx_ref, weight_type, n_embd, n_embd);
+    ggml_tensor * gate_ref_w  = ggml_new_tensor_2d(ctx_ref, weight_type, n_embd, n_ff);
+    ggml_tensor * up_ref_w    = ggml_new_tensor_2d(ctx_ref, weight_type, n_embd, n_ff);
+    ggml_tensor * down_ref_w  = ggml_new_tensor_2d(ctx_ref, weight_type, n_ff, n_embd);
+    ggml_tensor * shexp_ref_w = ggml_new_tensor_2d(ctx_ref, weight_type, n_embd, 1);
+    ggml_tensor * routed_ref  = ggml_mul_mat(ctx_ref, routed_ref_w, x_ref);
+    ggml_tensor * up_ref      = ggml_mul_mat(ctx_ref, up_ref_w, x_ref);
+    ggml_tensor * gate_ref    = ggml_mul_mat(ctx_ref, gate_ref_w, x_ref);
+    ggml_tensor * silu_ref    = ggml_silu(ctx_ref, gate_ref);
+    ggml_tensor * hid_ref     = ggml_mul(ctx_ref, silu_ref, up_ref);
+    ggml_tensor * shared_ref  = ggml_mul_mat(ctx_ref, down_ref_w, hid_ref);
+    ggml_tensor * sg_ref      = ggml_mul_mat(ctx_ref, shexp_ref_w, x_ref);
+    ggml_tensor * sig_ref     = ggml_sigmoid(ctx_ref, sg_ref);
+    shared_ref = ggml_mul(ctx_ref, shared_ref, sig_ref);
+    ggml_tensor * out_ref = ggml_add(ctx_ref, routed_ref, shared_ref);
+    ggml_cgraph * gf_ref = ggml_new_graph(ctx_ref);
+    ggml_build_forward_expand(gf_ref, out_ref);
+
+    ggml_backend_t backend_ref = ggml_backend_cpu_init();
+    require(backend_ref != nullptr, "failed to initialize reference CPU backend");
+    ggml_backend_buffer_t buffer_ref = ggml_backend_alloc_ctx_tensors(ctx_ref, backend_ref);
+    require(buffer_ref != nullptr, "failed to allocate reference CPU tensors");
+
+    std::vector<uint8_t> gateq(ggml_nbytes(gate_ref_w));
+    std::vector<uint8_t> upq(ggml_nbytes(up_ref_w));
+    std::vector<uint8_t> downq(ggml_nbytes(down_ref_w));
+    ggml_quantize_chunk(weight_type, gatev.data(), gateq.data(), 0, ggml_nrows(gate_ref_w), gate_ref_w->ne[0], nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, upv.data(),   upq.data(),   0, ggml_nrows(up_ref_w),   up_ref_w->ne[0],   nullptr, nullptr);
+    ggml_quantize_chunk(weight_type, downv.data(), downq.data(), 0, ggml_nrows(down_ref_w), down_ref_w->ne[0], nullptr, nullptr);
+
+    ggml_backend_tensor_set(x_ref,        xv.data(),      0, ggml_nbytes(x_ref));
+    ggml_backend_tensor_set(routed_ref_w, routedq.data(), 0, ggml_nbytes(routed_ref_w));
+    ggml_backend_tensor_set(gate_ref_w,   gateq.data(),   0, ggml_nbytes(gate_ref_w));
+    ggml_backend_tensor_set(up_ref_w,     upq.data(),     0, ggml_nbytes(up_ref_w));
+    ggml_backend_tensor_set(down_ref_w,   downq.data(),   0, ggml_nbytes(down_ref_w));
+    ggml_backend_tensor_set(shexp_ref_w,  shexpq.data(),  0, ggml_nbytes(shexp_ref_w));
+    require(ggml_backend_graph_compute(backend_ref, gf_ref) == GGML_STATUS_SUCCESS, "reference shared-expert graph failed");
+
+    std::vector<float> want(ggml_nelements(out_ref), 0.0f);
+    ggml_backend_tensor_get(out_ref, want.data(), 0, ggml_nbytes(out_ref));
+
+    for (size_t i = 0; i < got.size(); ++i) {
+        require_near_tol(got[i], want[i], 5e-3f, "scheduler shared-expert split mismatch");
+    }
+
+    ggml_backend_buffer_free(buffer_ref);
+    ggml_backend_free(backend_ref);
+    ggml_free(ctx_ref);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backends[0]);
+    ggml_backend_free(backends[1]);
+    ggml_backend_free(backends[2]);
+    ggml_free(ctx);
+#endif
+}
+
 int main() {
     roundtrip_split(0);
     roundtrip_split(1);
@@ -474,6 +725,7 @@ int main() {
     test_reduce_add_cpu_backend();
     test_scheduler_reduce_on_numa_backends();
     test_scheduler_moe_hidden_split();
+    test_scheduler_shared_expert_gate_split();
     std::puts("cpu-numa-tp tests passed");
     return 0;
 }

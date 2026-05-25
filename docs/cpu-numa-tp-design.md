@@ -563,6 +563,30 @@ FFN hidden dimension, reduces the shard outputs, and compares against a
 separate plain-CPU full-weight Q8_0 reference. With 32-wide hidden shards this
 passes within normal F32 accumulation-order tolerance, so the basic routed MoE
 hidden-dimension split/reduce algebra is not the Qwen122B failure by itself.
+It also includes a scheduler-level Q8_0 shared-expert/gate split check: two
+CPU-NUMA shared-expert up/gate/down shards use a replicated scalar shared gate,
+add the routed output to one shard before reduce, and compare against a
+separate plain-CPU full-weight reference. That passes too, so the normal
+shared-expert hidden split, scalar gate, add-once, and reduce algebra is not
+the Qwen122B failure by itself either.
+
+During that shared-expert test, leaving the shard-local SwiGLU/gate multiply as
+`ggml_fused_mul_unary` exposed intermittent large synthetic mismatches under
+the CPU-NUMA scheduler. The CPU-TP graph builder now avoids
+`ggml_fused_mul_unary` when `cpu_tp > 1`, spelling those paths as explicit
+unary plus multiply. The synthetic shared-expert check passed 40 consecutive
+runs with this unfused CPU-TP path.
+
+A representative Qwen122B CPU-TP `-n 4` rerun with that unfused CPU-TP path
+still generated ` аген2 human2`:
+
+```text
+/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-no-fused-mul-unary-cputp-t96-n4.log
+load time 293291.88 ms, eval time 1916.81 ms / 4 tokens, 2.09 tok/s
+```
+
+So fused unary multiply instability is a real CPU-TP graph hazard to avoid, but
+it is not the representative Qwen35MoE correctness cause by itself.
 
 These checks passed under:
 
