@@ -4972,6 +4972,17 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
     }
+#ifdef __gnu_linux__
+    if (lctx.model.cpu_tp == 2 && lctx.model.hparams.n_expert > 0) {
+        const int node_threads = std::max(4, std::min(16, n_threads / 6));
+        for (ggml_backend_t backend : lctx.backends) {
+            if (ggml_backend_is_cpu(backend) && ggml_backend_cpu_get_numa_node(backend) >= 0) {
+                ggml_backend_cpu_set_n_threads(backend, node_threads);
+                ggml_backend_cpu_set_abort_callback(backend, lctx.abort_callback, lctx.abort_callback_data);
+            }
+        }
+    }
+#endif
 #ifdef GGML_USE_BLAS
     if (lctx.backend_blas != nullptr) {
         ggml_backend_blas_set_n_threads(lctx.backend_blas, n_threads);

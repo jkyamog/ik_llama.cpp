@@ -613,11 +613,40 @@ This matches the ordinary CPU baseline prefix for the same prompt and seed.
 The earlier wrong output, ` аген2 human2`, is no longer reproduced by the
 representative short gate.
 
+Follow-up CPU-NUMA child backend thread tuning:
+
+- Temporarily forcing higher CPU-NUMA child backend thread counts on the dense
+  Q4 TinyLlama smoke was harmful. With `LLAMA_CPU_TP_NODE_THREADS=8` and `16`
+  in an experiment build, the Q4 CPU-TP generation rate dropped to about
+  19.7-19.9 tokens/s, well below the prior first-touch CPU-TP Q4 point of
+  about 37.1 tokens/s.
+- The same temporary thread override on the representative Qwen35MoE 122B Q8
+  MoE target improved generation. At 16 child backend threads, the `-n 4`
+  short gate generated `, I am a` and measured about 3.30 tokens/s. At 24 child
+  backend threads it regressed to about 2.99 tokens/s.
+- The kept heuristic is therefore MoE-only: for `--cpu-tp 2` models with
+  experts, CPU-NUMA child backends use `clamp(n_threads / 6, 4, 16)` threads.
+  Dense models keep the previous default child backend threading.
+- The rebuilt-source Qwen35MoE 122B Q8 short gate with this heuristic generated
+  `, I am a`, loaded in about 382 s, and measured about 3.60 tokens/s:
+
+```text
+/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-moe-thread-heuristic-t96-n4-pipefail.log
+load time 381770.25 ms, eval time 1111.23 ms / 4 tokens, 3.60 tok/s
+```
+
+That is now slightly faster than the ordinary CPU baseline short-run generation
+point of about 3.43 tokens/s, but it is only about a 5% improvement, not the
+roughly 10% Task H target. Load time also remains materially worse than the
+ordinary CPU baseline because the CPU-NUMA split-buffer path still allocates and
+copies about 120420 MiB during load.
+
 These checks passed under:
 
 ```bash
 cmake --build build-debug-no-cuda --target llama-cli test-cpu-numa-tp -j4
 ctest --test-dir build-debug-no-cuda -R test-cpu-numa-tp --output-on-failure
+git diff --check
 ```
 
 Current verdict:
@@ -625,8 +654,9 @@ Current verdict:
 CPU-NUMA tensor parallelism has narrow CLI correctness evidence for F32 and Q4
 smoke models, including `--no-flash-attn`, and the Q4 server path can start and
 answer a request. The representative Qwen35MoE 122B Q8 short gate now matches
-the ordinary CPU baseline prefix after fixing split FFN norm handling. It is
-still not ready for Task 12 performance claims or serving-config adoption:
-representative CPU-TP generation remains slower than baseline, and load time is
-materially worse. Next work should focus on the performance and load-time causes
-before considering any serving adoption.
+the ordinary CPU baseline prefix after fixing split FFN norm handling. A
+MoE-only CPU-NUMA child thread heuristic narrows the generation gap enough to
+edge past the baseline short-run throughput, but it still does not reach the
+Task H performance target and load time is materially worse. Next work should
+focus on the remaining throughput gap, graph split overhead, and load-time
+causes before considering any serving adoption.
