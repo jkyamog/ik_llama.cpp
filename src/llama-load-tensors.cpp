@@ -4368,6 +4368,16 @@ bool create_tensors_helper::create_tensors() {
         if (model.max_gpu > 0 && model.max_gpu < int(model.splits.size())) {
             gpu_split_count.resize(model.splits.size(), 0.0f);
         }
+        auto split_granularity = [&](const ggml_tensor * tensor, int gpu_granularity) {
+            int granularity = model.cpu_tp == 2 ? 1 : gpu_granularity;
+            if (ggml_is_quantized(tensor->type)) {
+                auto tt = ggml_internal_get_type_traits(tensor->type);
+                if (tt.blck_size > granularity) {
+                    granularity = tt.blck_size;
+                }
+            }
+            return granularity;
+        };
         for (int il = 0; il < n_layer; ++il) {
             // For now only run MTP into the per-layer
             if (model.mtp && hparams.nextn_predict_layers > 0 &&
@@ -4581,11 +4591,7 @@ bool create_tensors_helper::create_tensors() {
                                  split_tensors.find(layer.ffn_gate) != split_tensors.end() &&
                                  split_tensors.find(layer.ffn_up)   != split_tensors.end();
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = split_granularity(layer.ffn_down, 16);
                     auto split = create_split(layer.ffn_down->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn:"); for ([[maybe_unused]] auto s : split) LLAMA_LOG_DEBUG(" %d", s); LLAMA_LOG_DEBUG("\n");
                     prepare_split_tensors(0, ctx_split, layer.ffn_down, layer.split_ffn_down, split, mem_used);
@@ -4601,11 +4607,7 @@ bool create_tensors_helper::create_tensors() {
                 bool use_split = split_tensors.find(layer.ffn_down_exps) != split_tensors.end() && has_up_gate;
 
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_exps->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_exps->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = split_granularity(layer.ffn_down_exps, 16);
                     ffn_split = create_split(layer.ffn_down_exps->ne[0], ffn_granularity, cur_splits, mem_used);
                     LLAMA_LOG_DEBUG("  split_ffn_exps:"); for ([[maybe_unused]] auto s : ffn_split) LLAMA_LOG_DEBUG(" %d", s);
                     LLAMA_LOG_DEBUG("\n");
@@ -4642,11 +4644,7 @@ bool create_tensors_helper::create_tensors() {
                                  split_tensors.find(layer.ffn_gate_shexp) != split_tensors.end() &&
                                  split_tensors.find(layer.ffn_up_shexp)   != split_tensors.end();
                 if (use_split) {
-                    int ffn_granularity = 16;
-                    if (ggml_is_quantized(layer.ffn_down_shexp->type)) {
-                        auto tt = ggml_internal_get_type_traits(layer.ffn_down_shexp->type);
-                        if (tt.blck_size > ffn_granularity) ffn_granularity = tt.blck_size;
-                    }
+                    int ffn_granularity = split_granularity(layer.ffn_down_shexp, 16);
                     auto split = create_split(layer.ffn_down_shexp->ne[0], ffn_granularity, cur_splits, mem_used);
                     bool ok = true;
                     if (!ffn_split.empty()) {
@@ -4726,7 +4724,7 @@ bool create_tensors_helper::create_tensors() {
                     LLAMA_LOG_INFO("%s: not splitting output tensor becausee buffer is host\n", __func__);
                 } else {
                     auto ctx_split = ctx_map[model.buft_output.buft_matrix];
-                    auto split = create_split(model.output->ne[1], 16, model.splits, mem_used);
+                    auto split = create_split(model.output->ne[1], split_granularity(model.output, 16), model.splits, mem_used);
                     prepare_split_tensors(1, ctx_split, model.output, model.split_output, split, mem_used);
                     if (auto it = split_tensors.find(model.output_norm); it != split_tensors.end() && !ggml_backend_buft_is_host(model.buft_output.buft_matrix)) {
                         auto ctx_split = ctx_map[model.buft_output.buft_matrix];

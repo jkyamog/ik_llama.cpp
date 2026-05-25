@@ -473,7 +473,7 @@ llm_expert_gating_func_type   gating_op,
     static ggml_tensor * do_split_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * the_norm, const llama_hparams & hparams,
         const llm_build_cb & cb, int id, int il_cb, bool is_norm);
 
-    static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor * input, int id);
+    static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor * input, int id, bool exact_reduce_input = false);
 
     static uint32_t llama_kv_qnext_state_slots(const llama_kv_cache & kv_self);
 
