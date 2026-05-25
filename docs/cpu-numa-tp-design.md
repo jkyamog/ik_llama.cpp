@@ -500,6 +500,10 @@ Server readiness on the Q4 model:
   CPU-NUMA child backend half of the requested threads improved prompt
   throughput but dropped Q4 generation to about 13.5 tokens/s, so it was also
   not kept.
+- A later FFN-only/first-touch sweep of CPU-NUMA child backend thread counts
+  showed the existing child backend default of 4 threads was the best generation
+  point among 1, 2, 4, 8, and 16 threads. Eight threads improved prompt
+  throughput but reduced generation throughput.
 
 Current verdict:
 
