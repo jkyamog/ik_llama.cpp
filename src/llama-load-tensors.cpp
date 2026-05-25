@@ -209,6 +209,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
         return ctx;
 
     }
+
+    ggml_context * cpu_tp_context_for_tensor(ggml_context * ctx, const std::string & name);
 };
 
 create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_model & _model) : ml(_ml), model(_model) {
@@ -442,9 +444,35 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
     return ctx;
 }
 
+ggml_context * create_tensors_helper::cpu_tp_context_for_tensor(ggml_context * ctx, const std::string & name) {
+    if (model.cpu_tp != 2 || ctx != split_ctx) {
+        return ctx;
+    }
+
+    if (name.find(".ffn_") != std::string::npos) {
+        return ctx;
+    }
+
+    const std::string blk = "blk.";
+    const size_t blk_pos = name.find(blk);
+    if (blk_pos == std::string::npos) {
+        return ctx_for_buft(default_cpu_buft);
+    }
+
+    const char * begin = name.c_str() + blk_pos + blk.size();
+    char * end = nullptr;
+    const long il = std::strtol(begin, &end, 10);
+    if (end == begin || il < 0 || il >= (long) model.buft_layer.size()) {
+        return ctx_for_buft(default_cpu_buft);
+    }
+
+    return ctx_for_buft(model.buft_layer[il].buft);
+}
+
 ggml_tensor * create_tensors_helper::create_tensor(ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne,
         int flags, ggml_context ** actual_context) {
     ctx = get_context_for_tensor(ctx, name);
+    ctx = cpu_tp_context_for_tensor(ctx, name);
     if (actual_context) *actual_context = ctx;
     auto tensor = ml.create_tensor(ctx, name, ne, flags);
     if (tensor && ctx == split_ctx) {
@@ -4412,20 +4440,20 @@ bool create_tensors_helper::create_tensors() {
             LLAMA_LOG_DEBUG("\n");
             auto & layer = model.layers[il];
             auto ctx_split = ctx_for_layer_split(il);
-            if (layer.attn_norm) {
+            if (model.cpu_tp != 2 && layer.attn_norm) {
                 prepare_split_tensors(-1, ctx_split, layer.attn_norm, layer.split_attn_norm, mirror, mem_used);
             }
-            if (model.arch == LLM_ARCH_GEMMA4 && layer.attn_post_norm) {
+            if (model.cpu_tp != 2 && model.arch == LLM_ARCH_GEMMA4 && layer.attn_post_norm) {
                 prepare_split_tensors(-1, ctx_split, layer.attn_post_norm, layer.split_attn_post_norm, mirror, mem_used);
             }
-            if (layer.rope_freqs) {
+            if (model.cpu_tp != 2 && layer.rope_freqs) {
                 auto split = create_split(ggml_nrows(layer.rope_freqs), -1, cur_splits, mem_used);
                 prepare_split_tensors(-1, ctx_split, layer.rope_freqs, layer.split_rope_freqs, split, mem_used);
             }
-            if (hparams.is_recurrent(il)) {
+            if (model.cpu_tp != 2 && hparams.is_recurrent(il)) {
                 split_recurrent_tensors(hparams, layer, cur_splits, mem_used, ctx_split, il); //, model.arch == LLM_ARCH_QWEN3NEXT ? 0 : 1);
             }
-            else if (layer.wo && layer.wq && layer.wk && (layer.wv || model.arch == LLM_ARCH_GEMMA4)) {
+            else if (model.cpu_tp != 2 && layer.wo && layer.wq && layer.wk && (layer.wv || model.arch == LLM_ARCH_GEMMA4)) {
                 auto granularity_kq = hparams.n_embd_head_k(il) * gqa_ratio;
                 int wq_ne1 = layer.wq->ne[1];
                 if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN35) {
@@ -4578,7 +4606,7 @@ bool create_tensors_helper::create_tensors() {
 
             // MLA tensor distribution (DEEPSEEK2/GLM_DSA/MISTRAL4). Detect by arch + absence of wk
             // since wkv_b can be null when the model was quantized by mainline llama.cpp.
-            if (layer.wo && !layer.wk &&
+            if (model.cpu_tp != 2 && layer.wo && !layer.wk &&
                 (model.arch == LLM_ARCH_DEEPSEEK2 ||
                  model.arch == LLM_ARCH_GLM_DSA ||
                  model.arch == LLM_ARCH_MISTRAL4)) {
@@ -4702,7 +4730,7 @@ bool create_tensors_helper::create_tensors() {
                 }
             }
 
-            if (layer.out_scale) {
+            if (model.cpu_tp != 2 && layer.out_scale) {
                 prepare_split_tensors(-1, ctx_split, layer.out_scale, layer.split_out_scale, std::vector<int>(model.splits.size(), 1), mem_used);
             }
         }

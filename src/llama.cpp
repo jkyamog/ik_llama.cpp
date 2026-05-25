@@ -848,7 +848,8 @@ static bool llama_kv_cache_init(
 
     bool split_cache   = false;
     bool replicate_mla = false;
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && !is_mla_attn && offload) {
+    if (model.cpu_tp != 2 &&
+            (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && !is_mla_attn && offload) {
         cache.split_k_l.reserve(n_layer);
         cache.split_v_l.reserve(n_layer);
         if (llama_model_has_recurrent(&model)) {
@@ -856,7 +857,8 @@ static bool llama_kv_cache_init(
         }
         split_cache = true;
     }
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && is_mla_attn && offload) {
+    if (model.cpu_tp != 2 &&
+            (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && is_mla_attn && offload) {
         cache.replicated_k_l.reserve(n_layer);
         replicate_mla = true;
     }
@@ -6747,11 +6749,6 @@ struct llama_context * llama_init_from_model(
         params.flash_attn = false;
     }
 
-    if (model->cpu_tp == 2 && !params.flash_attn) {
-        LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) requires flash_attn for split attention v1\n", __func__);
-        return nullptr;
-    }
-
     //if (params.flash_attn && model->hparams.n_embd_head_k != model->hparams.n_embd_head_v) {
     //    LLAMA_LOG_WARN("%s: flash_attn requires n_embd_head_k == n_embd_head_v - forcing off\n", __func__);
     //    params.flash_attn = false;
@@ -6821,6 +6818,10 @@ struct llama_context * llama_init_from_model(
     cparams.split_mode_graph_scheduling = params.split_mode_graph_scheduling;
     //cparams.split_mode_f16   = params.split_mode_f16;
     cparams.scheduler_async  = params.scheduler_async;
+    if (model->cpu_tp == 2 && !cparams.scheduler_async) {
+        LLAMA_LOG_INFO("%s: enabling scheduler_async for CPU tensor-parallel FFN split\n", __func__);
+        cparams.scheduler_async = true;
+    }
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;

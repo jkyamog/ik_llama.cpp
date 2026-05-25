@@ -442,10 +442,12 @@ Generated:
 , there was a young woman named Lily. Lily was a kind and
 ```
 
-`--cpu-tp 2 --no-flash-attn` is explicitly rejected during context
-initialization because CPU-TP v1 only implements split attention through the
-flash-attention split graph path. This avoids the previous generic split-tensor
-segfault.
+CPU-TP v1 has been narrowed to FFN-only split placement. Attention tensors,
+rope tensors, and KV cache tensors stay on ordinary CPU/CPU-NUMA buffers, while
+FFN and MoE tensors use `CPU-NUMA-Split`. This removes the split-attention flash
+assertion class and allows both default flash attention and `--no-flash-attn`.
+CPU-TP now enables split scheduler async by default because the FFN split graph
+is stable with async and materially faster than the synchronous path.
 
 Threaded local performance smoke on the same Q4 model is negative:
 
@@ -461,10 +463,12 @@ build-debug-no-cuda/bin/llama-cli \
   -n 64 -s 42 -t 52 -tb 52 --cpu-tp 2 --no-warmup --temp 0 --no-display-prompt
 ```
 
-Both generated the same text. A later baseline sample measured about 201 prompt
-tokens/s and 44.5 generation tokens/s. CPU-TP measured about 66 prompt tokens/s
-and 13.5 generation tokens/s. This is not a useful performance direction for
-this model/host configuration.
+Both generated the same text. After FFN-only placement and default async
+scheduling, the latest local sample measured about 219 prompt tokens/s and
+38.8 generation tokens/s for baseline CPU, versus about 47 prompt tokens/s and
+25.8 generation tokens/s for CPU-TP. The crash-prone full-attention split path
+is gone, but this is still not a useful performance direction for this
+model/host configuration.
 
 Server readiness on the Q4 model:
 
@@ -477,8 +481,9 @@ Server readiness on the Q4 model:
   speculative-decoding request.
 - `llama-server --cpu-tp 2 -t 52 -tb 52 --no-warmup` reaches
   `HTTP server listening` and serves a `/completion` request for the Q4 model.
-  The request generated the expected prefix and measured about 57 prompt
-  tokens/s and 13.2 generation tokens/s.
+  With FFN-only placement and default async scheduling, the request generated
+  the expected prefix and measured about 90 prompt tokens/s and 34 generation
+  tokens/s.
 - An uncommitted experiment that propagated the requested thread count into
   CPU-NUMA child backends made CPU-TP slower and could re-trigger the
   flash-attention assert, so it was not kept.
@@ -486,8 +491,9 @@ Server readiness on the Q4 model:
 Current verdict:
 
 CPU-NUMA tensor parallelism now has narrow CLI correctness evidence for F32 and
-Q4 smoke models, and the Q4 server path can now start and answer a request. It
-is still not ready for Task 12 performance claims or serving-config adoption.
-The current implementation is much slower than baseline on the local Q4 smoke.
-Next work should either find a CPU-TP scheduling/threading design that improves
-throughput or stop this spike as not performance-useful.
+Q4 smoke models, including `--no-flash-attn`, and the Q4 server path can start
+and answer a request. It is still not ready for Task 12 performance claims or
+serving-config adoption. FFN-only placement makes the implementation stable,
+but the local Q4 smoke remains slower than baseline. Next work should either
+find a CPU-TP scheduling/threading design that closes that gap or stop this
+spike as not performance-useful.
