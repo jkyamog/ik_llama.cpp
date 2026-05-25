@@ -635,9 +635,18 @@ Follow-up CPU-NUMA child backend thread tuning:
 load time 381770.25 ms, eval time 1111.23 ms / 4 tokens, 3.60 tok/s
 ```
 
-That is now slightly faster than the ordinary CPU baseline short-run generation
-point of about 3.43 tokens/s, but it is only about a 5% improvement, not the
-roughly 10% Task H target. Load time also remains materially worse than the
+The apples-to-apples `-n 8` rerun with the same heuristic generated the same
+prefix as the ordinary CPU baseline, `, I am a 20 year`, loaded in about 390 s,
+and measured about 4.21 tokens/s:
+
+```text
+/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-moe-thread-heuristic-t96-n8-pipefail.log
+load time 390156.12 ms, eval time 1899.36 ms / 8 tokens, 4.21 tok/s
+```
+
+That is about a 23% generation-throughput improvement over the ordinary CPU
+baseline `-n 8` point of about 3.43 tokens/s, so the representative Task H
+throughput gate is now met. Load time remains materially worse than the
 ordinary CPU baseline because the CPU-NUMA split-buffer path still allocates and
 copies about 120420 MiB during load.
 
@@ -655,8 +664,7 @@ CPU-NUMA tensor parallelism has narrow CLI correctness evidence for F32 and Q4
 smoke models, including `--no-flash-attn`, and the Q4 server path can start and
 answer a request. The representative Qwen35MoE 122B Q8 short gate now matches
 the ordinary CPU baseline prefix after fixing split FFN norm handling. A
-MoE-only CPU-NUMA child thread heuristic narrows the generation gap enough to
-edge past the baseline short-run throughput, but it still does not reach the
-Task H performance target and load time is materially worse. Next work should
-focus on the remaining throughput gap, graph split overhead, and load-time
-causes before considering any serving adoption.
+MoE-only CPU-NUMA child thread heuristic now clears the representative Task H
+generation-throughput target on the apples-to-apples `-n 8` gate, but load time
+is materially worse. Next work should focus on the split-buffer load path and
+serving adoption risk before considering any serving-config change.
