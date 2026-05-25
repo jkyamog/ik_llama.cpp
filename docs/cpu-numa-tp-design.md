@@ -692,6 +692,50 @@ Representative Qwen122B CPU-TP server validation:
 This validates the representative Qwen server path without changing Docker or
 the active serving config.
 
+Representative Qwen122B CPU-TP OpenClaw payload smoke:
+
+- Command shape:
+  `llama-server -m <Qwen122B Q8 split GGUF> -t 96 -tb 96 -c 32768 -b 128 -ub 128 --no-warmup --temp 0.6 --cpu-tp 2 --host 127.0.0.1 --port 18080 --log-format text`
+- Payload command:
+  `HOST=127.0.0.1 PORT=18080 MAX_TOKENS=64 TEMPERATURE=0.6 OUT_DIR=/tmp/cpu-numa-tp-openclaw-smoke-rmscast-addfix scripts/test_openclaw_payload_local.sh`
+- Server log:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-openclaw-c32768-rmscast-addfix-p18080.log`
+- Payload output:
+  `/tmp/cpu-numa-tp-openclaw-smoke-rmscast-addfix/payload_local_20260525_204559`
+- Result summary: HTTP 200, no error, choices present, finish reason `stop`.
+- Token counts: 26,747 prompt tokens, 64 generated tokens.
+- Server timing: prompt eval 1,020,093.53 ms / 26,747 tokens, about
+  26.22 prompt tokens/s; eval 71,834.53 ms / 64 tokens, about
+  0.89 generated tokens/s; total 1,091,928.06 ms / 26,811 tokens.
+- Clean rerun with the active Docker server and OpenClaw gateway stopped:
+  - Branch server log:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-openclaw-c32768-rerun2-branch-p18080.log`
+  - Branch payload output:
+    `/tmp/cpu-numa-tp-openclaw-smoke-rerun2-branch/payload_local_20260525_212340`
+  - Branch result: HTTP 200, 26,747 prompt tokens, 64 generated tokens,
+    34.55 prompt tokens/s, 5.13 generated tokens/s.
+  - `origin/main` baseline was built in `/tmp/ik_llama_openclaw_main` at
+    `b4e1d916` and run with the same command shape minus `--cpu-tp 2`.
+  - Main server log:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-main-server-openclaw-c32768-rerun2-p18080.log`
+  - Main payload output:
+    `/tmp/cpu-numa-tp-openclaw-smoke-rerun2-main/payload_local_20260525_213954`
+  - Main result: HTTP 200, 26,747 prompt tokens, 64 generated tokens,
+    65.80 prompt tokens/s, 5.74 generated tokens/s.
+  - Caveat: `origin/main` ignored the MTP-layer tensors from this GGUF, so this
+    is a practical pre-branch baseline, not a same-feature MTP/CPU-TP comparison.
+- Task H outcome: this proves the CPU-TP long-prompt server path is functional,
+  but it does not beat the clean `origin/main` baseline on this payload. Keep
+  the branch as validated CPU-NUMA TP work, but do not deploy it as the active
+  serving config from current performance evidence.
+- This smoke exposed two long-prefill CPU graph gaps that short prompts did
+  not hit:
+  - RMS norm inputs can arrive as reduced half tensors; `llm_build_norm()` now
+    casts RMS inputs to F32 before constructing the norm op.
+  - CPU `ggml_add` now supports F32 plus F16/BF16 right-hand operands with
+    normal `ggml_can_repeat()` broadcasting, covered by
+    `tests/test-cpu-numa-tp.cpp`.
+
 Dense Q4 guard after the split-buffer load change:
 
 - Log: `/tmp/cpu-numa-tp-logs/cputp-q4-copy-firsttouch-t52-n16.log`
@@ -702,7 +746,7 @@ Dense Q4 guard after the split-buffer load change:
 These checks passed under:
 
 ```bash
-cmake --build build-debug-no-cuda --target llama-cli test-cpu-numa-tp -j4
+cmake --build build-debug-no-cuda --target llama-cli llama-server test-cpu-numa-tp -j4
 ctest --test-dir build-debug-no-cuda -R test-cpu-numa-tp --output-on-failure
 git diff --check
 ```
@@ -716,7 +760,11 @@ starts and serves the baseline-matching short completion. The representative
 Qwen35MoE 122B Q8 short gate matches the ordinary CPU baseline prefix after
 fixing split FFN norm handling. A MoE-only CPU-NUMA child thread heuristic
 clears the representative Task H generation-throughput target on the
-apples-to-apples `-n 8` CLI gate, and copy-as-first-touch split loading narrows
-the large load-time penalty substantially. The implementation is ready for a
-user go/no-go decision about deploying the experimental `--cpu-tp 2` serving
-config; no active serving config has been changed in this spike.
+apples-to-apples `-n 8` CLI gate, copy-as-first-touch split loading narrows
+the large load-time penalty substantially, and the full local OpenClaw payload
+smoke now completes through long prefill and generation. The clean rerun after
+stopping unrelated services improved CPU-TP OpenClaw generation from 0.89 to
+5.13 tokens/s, but the clean `origin/main` baseline still measured 5.74
+tokens/s on the same payload shape. This branch is validated for CPU-NUMA TP
+functionality but should not be adopted as the active serving config on current
+performance evidence. No active serving config has been changed in this spike.
