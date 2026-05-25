@@ -352,6 +352,9 @@ Implemented since Task B:
   rejecting startup.
 - `CPU-NUMA-Split` allocates shard tensors on `CPU-NUMA0` and `CPU-NUMA1`
   child buffer types.
+- `CPU-NUMA<i>` buffers now first-touch allocated pages while temporarily bound
+  to the target NUMA node, so node buffer identity also influences physical page
+  placement instead of being only scheduler metadata.
 - CPU `GGML_OP_REDUCE` add is implemented for F32, F16, and BF16.
 - CPU-TP graph construction uses the full reduced activation as the next shard
   input for CPU-TP, avoiding the GPU-oriented shortcut that reuses per-shard
@@ -464,11 +467,14 @@ build-debug-no-cuda/bin/llama-cli \
 ```
 
 Both generated the same text. After FFN-only placement and default async
-scheduling, the latest local sample measured about 219 prompt tokens/s and
-38.8 generation tokens/s for baseline CPU, versus about 47 prompt tokens/s and
-25.8 generation tokens/s for CPU-TP. The crash-prone full-attention split path
-is gone, but this is still not a useful performance direction for this
-model/host configuration.
+scheduling, the pre-first-touch local sample measured about 219 prompt tokens/s
+and 38.8 generation tokens/s for baseline CPU, versus about 47 prompt tokens/s
+and 25.8 generation tokens/s for CPU-TP. After adding CPU-NUMA buffer
+first-touch, a later sample measured about 148 prompt tokens/s and
+42.4 generation tokens/s for baseline CPU, versus about 79 prompt tokens/s and
+37.1 generation tokens/s for CPU-TP. The crash-prone full-attention split path
+is gone and first-touch narrows the generation gap, but this is still not a
+serving-performance win for this model/host configuration.
 
 Server readiness on the Q4 model:
 
@@ -482,8 +488,11 @@ Server readiness on the Q4 model:
 - `llama-server --cpu-tp 2 -t 52 -tb 52 --no-warmup` reaches
   `HTTP server listening` and serves a `/completion` request for the Q4 model.
   With FFN-only placement and default async scheduling, the request generated
-  the expected prefix and measured about 90 prompt tokens/s and 34 generation
-  tokens/s.
+  the expected prefix and measured about 72 prompt tokens/s and 37 generation
+  tokens/s after CPU-NUMA buffer first-touch.
+- `numastat -p` on the live Q4 CPU-TP server showed process private memory
+  distributed across both nodes after load, about 322 MiB on node 0 and
+  443 MiB on node 1 in the local smoke.
 - An uncommitted experiment that propagated the requested thread count into
   CPU-NUMA child backends made CPU-TP slower and could re-trigger the
   flash-attention assert, so it was not kept.
@@ -497,7 +506,8 @@ Current verdict:
 CPU-NUMA tensor parallelism now has narrow CLI correctness evidence for F32 and
 Q4 smoke models, including `--no-flash-attn`, and the Q4 server path can start
 and answer a request. It is still not ready for Task 12 performance claims or
-serving-config adoption. FFN-only placement makes the implementation stable,
-but the local Q4 smoke remains slower than baseline. Next work should either
-find a CPU-TP scheduling/threading design that closes that gap or stop this
-spike as not performance-useful.
+serving-config adoption. FFN-only placement plus CPU-NUMA buffer first-touch
+makes the implementation stable and much closer to baseline generation speed,
+but the local Q4 smoke remains slower than baseline overall. Next work should
+either find a CPU-TP scheduling/threading design that closes the remaining gap
+or stop this spike as not performance-useful.

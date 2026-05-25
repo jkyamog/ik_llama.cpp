@@ -17,6 +17,12 @@
 #include <chrono>
 #include <barrier>
 #include <thread>
+#ifdef __gnu_linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -760,18 +766,86 @@ struct ggml_backend_cpu_numa_buft_ctx {
     char name[32];
 };
 
+static bool ggml_backend_cpu_numa_node_cpuset(uint32_t numa_node, cpu_set_t * cpus, size_t setsize) {
+    CPU_ZERO_S(setsize, cpus);
+
+    struct stat st;
+    char path[256];
+    uint32_t n_cpus = 0;
+    for (uint32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        const int rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", numa_node, cpu);
+        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+        if (stat(path, &st) == 0) {
+            CPU_SET_S(cpu, setsize, cpus);
+            ++n_cpus;
+        }
+    }
+
+    return n_cpus > 0;
+}
+
+static void ggml_backend_cpu_numa_first_touch(uint32_t numa_node, void * data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return;
+    }
+
+    cpu_set_t previous;
+    const int get_rv = pthread_getaffinity_np(pthread_self(), sizeof(previous), &previous);
+
+    cpu_set_t cpus;
+    bool affinity_set = false;
+    if (get_rv == 0 && ggml_backend_cpu_numa_node_cpuset(numa_node, &cpus, sizeof(cpus))) {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        int n_allowed = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &previous) && CPU_ISSET(cpu, &cpus)) {
+                CPU_SET(cpu, &allowed);
+                ++n_allowed;
+            }
+        }
+        if (n_allowed > 0) {
+            cpus = allowed;
+        }
+        const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+        if (set_rv == 0) {
+            affinity_set = true;
+        } else {
+            fprintf(stderr, "%s: warning: failed to bind first-touch to CPU-NUMA%u: %s\n",
+                    __func__, numa_node, strerror(set_rv));
+        }
+    }
+
+    const long page_size_sys = sysconf(_SC_PAGESIZE);
+    const size_t page_size = page_size_sys > 0 ? (size_t) page_size_sys : (size_t) 4096;
+    volatile char * ptr = (volatile char *) data;
+    for (size_t offset = 0; offset < size; offset += page_size) {
+        ptr[offset] = 0;
+    }
+    ptr[size - 1] = 0;
+
+    if (affinity_set && get_rv == 0) {
+        const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(previous), &previous);
+        if (set_rv != 0) {
+            fprintf(stderr, "%s: warning: failed to restore CPU affinity: %s\n", __func__, strerror(set_rv));
+        }
+    }
+}
+
 static const char * ggml_backend_cpu_numa_buft_get_name(ggml_backend_buffer_type_t buft) {
     struct ggml_backend_cpu_numa_buft_ctx * ctx = (struct ggml_backend_cpu_numa_buft_ctx *)buft->context;
     return ctx->name;
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_numa_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    struct ggml_backend_cpu_numa_buft_ctx * ctx = (struct ggml_backend_cpu_numa_buft_ctx *)buft->context;
     size += TENSOR_ALIGNMENT;
     void * data = malloc(size);
     if (data == NULL) {
         fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
     }
+    ggml_backend_cpu_numa_first_touch(ctx->numa_node, data, size);
     return ggml_backend_buffer_init(buft, cpu_backend_buffer_i, data, size);
 }
 
