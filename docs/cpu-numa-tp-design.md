@@ -405,7 +405,7 @@ timeout 8s build-debug-no-cuda/bin/llama-server \
 The server loaded the model, initialized `CPU-NUMA0` and `CPU-NUMA1`, and
 reached `HTTP server listening` on `127.0.0.1:18080`.
 
-Quantized-model blocker:
+Quantized-model follow-up:
 
 A larger quantized smoke model,
 `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`
@@ -426,16 +426,61 @@ Generated:
 , there was a young woman named Lily. Lily was a kind and
 ```
 
-The same model with `--cpu-tp 2` is not yet correct:
+After fixing CPU-TP graph input handling, the same fixed-thread CPU-TP command
+now generates the same text with default flash attention:
 
-- with default flash attention, it aborts in
-  `ggml/src/./iqk/fa/iqk_fa_templates.h:1157` with `GGML_ASSERT(S > 0)`;
-- with `--no-flash-attn`, it segfaults after model initialization and before
-  timings are printed.
+```bash
+build-debug-no-cuda/bin/llama-cli \
+  -m models/perf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  -p "Once upon a time" -n 16 -s 42 -t 1 -tb 1 --cpu-tp 2 \
+  --no-warmup --temp 0 --no-display-prompt
+```
+
+Generated:
+
+```text
+, there was a young woman named Lily. Lily was a kind and
+```
+
+`--cpu-tp 2 --no-flash-attn` is explicitly rejected during context
+initialization because CPU-TP v1 only implements split attention through the
+flash-attention split graph path. This avoids the previous generic split-tensor
+segfault.
+
+Threaded local performance smoke on the same Q4 model is negative:
+
+```bash
+build-debug-no-cuda/bin/llama-cli \
+  -m models/perf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  -p "Once upon a time in a small village near the mountains" \
+  -n 64 -s 42 -t 52 -tb 52 -ngl 0 --no-warmup --temp 0 --no-display-prompt
+
+build-debug-no-cuda/bin/llama-cli \
+  -m models/perf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
+  -p "Once upon a time in a small village near the mountains" \
+  -n 64 -s 42 -t 52 -tb 52 --cpu-tp 2 --no-warmup --temp 0 --no-display-prompt
+```
+
+Both generated the same text. The baseline measured about 199 prompt tokens/s
+and 33.5 generation tokens/s. CPU-TP measured about 25.6 prompt tokens/s and
+12.0 generation tokens/s. This is not a useful performance direction for this
+model/host configuration.
+
+Server readiness remains unsafe for threaded CPU-TP on the Q4 model:
+
+- `llama-server --cpu-tp 2 -t 1 -tb 1` reached `HTTP server listening`;
+- `-t 2`, `-t 4`, and `-t 16` also reached `HTTP server listening` in an
+  8-second timeout smoke;
+- `-t 8`, `-t 26`, and `-t 52` logged
+  `ggml/src/./iqk/fa/iqk_fa_templates.h:1157: GGML_ASSERT(S > 0) failed`
+  during or immediately after slot initialization and did not reach the ready
+  line within the timeout.
 
 Current verdict:
 
-CPU-NUMA tensor parallelism is correct only for the narrow F32 tiny-model
-smoke. The branch is not ready for Task 12 performance claims or serving-config
-adoption because quantized-model CPU-TP execution still fails. Next work should
-debug the quantized split attention/KV-cache path before any benchmark decision.
+CPU-NUMA tensor parallelism now has narrow CLI correctness evidence for F32 and
+Q4 smoke models, but it is not ready for Task 12 performance claims or
+serving-config adoption. The current implementation is slower than baseline on
+the local Q4 smoke and the server path has thread-count-sensitive flash
+attention asserts. Next work should either debug the threaded server split
+attention path or stop this spike as not performance-useful.
