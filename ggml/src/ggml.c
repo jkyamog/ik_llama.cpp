@@ -26255,7 +26255,32 @@ typedef int ggml_lock_t;
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
+static void set_numa_thread_affinity(int thread_n, const struct ggml_cplan * cplan) {
+    // Check for backend-local NUMA node first (e.g., CPU-NUMA0/1 with --cpu-tp)
+    // Backend-local NUMA takes precedence over global --numa behavior
+    if (cplan != NULL && cplan->numa_node >= 0) {
+        // Apply affinity to the specified NUMA node directly
+        int32_t node_num = cplan->numa_node;
+        if ((uint32_t)node_num >= g_state.numa.n_nodes) {
+            // Invalid node, skip affinity
+            return;
+        }
+        int rv;
+        size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
+        struct ggml_numa_node * node = &g_state.numa.nodes[node_num];
+        cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+        CPU_ZERO_S(setsize, cpus);
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            CPU_SET_S(node->cpus[i], setsize, cpus);
+        }
+        rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+        if (rv) {
+            fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+        }
+        CPU_FREE(cpus);
+        return;
+    }
+
     if (!ggml_is_numa()) {
         return;
     }
@@ -26323,7 +26348,7 @@ static void clear_numa_thread_affinity(void) {
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n, const struct ggml_cplan * cplan) { UNUSED(thread_n); UNUSED(cplan); }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
@@ -26585,6 +26610,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
 
     struct ggml_cplan cplan;
     memset(&cplan, 0, sizeof(struct ggml_cplan));
+    cplan.numa_node = -1;  // default: no backend-local NUMA, use global behavior
 
     int max_tasks = 1;
 
@@ -26789,7 +26815,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    set_numa_thread_affinity(state->ith, cplan);
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,

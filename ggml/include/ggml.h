@@ -823,6 +823,9 @@ extern "C" {
 
         int n_threads;
 
+        // optional backend-local NUMA node identity for worker thread affinity
+        int32_t numa_node; // -1 = not set, use global NUMA behavior
+
         // abort ggml_graph_compute when true
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;

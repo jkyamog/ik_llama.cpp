@@ -931,6 +931,11 @@ GGML_CALL static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(gg
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
 
+#ifdef __gnu_linux__
+    // Propagate backend-local NUMA node for worker thread affinity
+    cpu_plan->cplan.numa_node = cpu_ctx->numa_node;
+#endif
+
     return cpu_plan;
 }
 
@@ -969,6 +974,11 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
 
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+
+#ifdef __gnu_linux__
+    // Pass backend-local NUMA node for worker thread affinity
+    cplan.numa_node = cpu_ctx->numa_node;
+#endif
 
     return ggml_graph_compute(cgraph, &cplan);
 }
