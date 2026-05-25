@@ -519,7 +519,7 @@ Baseline ordinary CPU:
 - Load time: about 224 s
 - Generation: about 3.43 tokens/s
 
-CPU-TP after first-touch:
+CPU-TP after first-touch, before the split-norm fix:
 
 - Log: `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-firsttouch-t96-n8.log`
 - Output for `-n 8`: ` аген2 human232)0`
@@ -588,6 +588,31 @@ load time 293291.88 ms, eval time 1916.81 ms / 4 tokens, 2.09 tok/s
 So fused unary multiply instability is a real CPU-TP graph hazard to avoid, but
 it is not the representative Qwen35MoE correctness cause by itself.
 
+The actual representative correctness bug was in the fully split routed MoE FFN
+path. `do_split_norm()` only applied the per-shard norm when the norm tensor was
+itself split and carried split metadata. Qwen35MoE `ffn_norm` tensors were being
+kept unsplit, so the split routed FFN path skipped `ffn_norm` entirely. Applying
+the norm tensor even when it is unsplit restored the representative output, but
+the first fix made the graph slow because the unsplit norm forced extra
+cross-node copies.
+
+The follow-up loader fix routes `.ffn_norm.` tensors to the CPU-TP split context
+when `--cpu-tp 2` is active. That lets the existing split tensor loading path
+own and replicate those norms like the other split FFN tensors.
+
+Representative Qwen122B CPU-TP after the split-norm and split-context fixes:
+
+- Log:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-split-norm-splitctx-t96-n4-pipefail.log`
+- Output for `-n 4`: `, I am a`
+- Load time: about 391 s
+- Generation: about 2.09 tokens/s
+- Graph splits: 200
+
+This matches the ordinary CPU baseline prefix for the same prompt and seed.
+The earlier wrong output, ` аген2 human2`, is no longer reproduced by the
+representative short gate.
+
 These checks passed under:
 
 ```bash
@@ -599,8 +624,9 @@ Current verdict:
 
 CPU-NUMA tensor parallelism has narrow CLI correctness evidence for F32 and Q4
 smoke models, including `--no-flash-attn`, and the Q4 server path can start and
-answer a request. It is not ready for Task 12 performance claims or
-serving-config adoption. On the representative Qwen35MoE 122B Q8 model,
-CPU-TP is both semantically wrong and slower than baseline. Next work must
-either find and fix the split-MoE correctness issue, or stop this spike as not
-correctness-safe for the target workload.
+answer a request. The representative Qwen35MoE 122B Q8 short gate now matches
+the ordinary CPU baseline prefix after fixing split FFN norm handling. It is
+still not ready for Task 12 performance claims or serving-config adoption:
+representative CPU-TP generation remains slower than baseline, and load time is
+materially worse. Next work should focus on the performance and load-time causes
+before considering any serving adoption.
