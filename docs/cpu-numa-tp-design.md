@@ -271,3 +271,75 @@ creation, and scheduler split-mode graph machinery. It still needs a CPU-NUMA
 split buffer type and a CPU reduce-add path. Do not remove the `--cpu-tp 2`
 startup rejection until both are present and a deterministic correctness test
 passes.
+
+## Task B: CPU-NUMA Split Buffer Shape
+
+Decision: implement a CPU-NUMA parent split buffer type that wraps existing
+per-node `CPU-NUMA<i>` child buffer types. The parent buffer is a logical owner
+for split tensors; node-local child buffers own the actual shard memory.
+
+Internal representation:
+
+- A singleton Linux-only parent buffer type named `CPU-NUMA-Split`.
+- Parent buffer context stores no bulk allocation. It may keep lightweight
+  accounting totals for debug logs, but shard buffers own their memory.
+- Each logical tensor that has `tensor->extra` as `ggml_split_tensor_t` is
+  initialized by allocating one child buffer for each present split shard.
+- Child buffers use `ggml_backend_cpu_numa_buffer_type(i)` so existing
+  NUMA-aware `supports_buft` dispatch maps shard tensors to `CPU-NUMA<i>`.
+- The parent split buft reports `is_host == false`. This is intentional: llama
+  split-mode graph currently skips split tensor preparation when the matrix
+  buffer type is host.
+
+Shard metadata:
+
+- Shape metadata stays in `llama_split_tensor::tensor_splits` and
+  `ggml_split_tensor_t::splits`, created by `prepare_split_tensors()`.
+- No new shard list is needed in the parent buffer. The parent buffer inspects
+  the logical tensor's existing `extra` pointer during `init_tensor`,
+  `set_tensor`, and `get_tensor`.
+- The split dimension and per-device shape are authoritative. Loading code must
+  copy according to the shard shapes, not recompute split boundaries from
+  `model.splits`.
+
+Shard sizing and alignment:
+
+- `get_alloc_size()` returns the sum of `ggml_nbytes(split)` for every present
+  shard, rounded only where the child CPU-NUMA buffer allocator requires it.
+- Child allocation uses the existing CPU tensor alignment. If later profiling
+  shows a need for page alignment or huge pages, that should be a separate
+  locality/performance task.
+- For Task C, allocation may use the current `malloc`-backed CPU-NUMA child
+  buffers. That proves representation and scheduler ownership. True node-local
+  allocation or first-touch can be tightened after the split parent exists.
+
+Loading behavior:
+
+- `set_tensor()` must accept whole-tensor writes only: `offset == 0` and
+  `size == ggml_nbytes(tensor)`.
+- `split_dim < 0` means replicate the full logical tensor into every present
+  shard.
+- `split_dim == 0` copies row chunks along `ne[0]`.
+- `split_dim == 1` copies contiguous chunks along `ne[1]`.
+- `split_dim == 2` copies contiguous chunks along `ne[2]`.
+- Explicit-range and repacked layouts can remain unsupported until Task D needs
+  them; abort with a clear message rather than silently misloading.
+
+Logical tensor exposure:
+
+- The parent logical tensor gets a dummy non-null base pointer like CUDA split
+  buffers. Runtime compute must use child shard tensors, not the parent `data`.
+- Parent split buffers are only for weight/model tensors. Scheduler compute
+  buffers for actual CPU-node execution remain per-node `CPU-NUMA<i>` buffers.
+- Fallback CPU buffers keep their existing semantics and do not become split
+  buffers.
+
+Platform and failure modes:
+
+- The parent split buffer API is Linux-only beside the existing CPU-NUMA child
+  buffer APIs. Non-Linux builds should not expose it.
+- `--cpu-tp 2` still rejects startup until allocation, loading, execution,
+  reduce, and deterministic parity are validated.
+- If fewer than two usable NUMA nodes are detected, CPU TP remains unavailable.
+- If a split tensor references more shards than available CPU-NUMA child buffer
+  types, allocation fails early.
