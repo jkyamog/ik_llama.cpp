@@ -461,26 +461,33 @@ build-debug-no-cuda/bin/llama-cli \
   -n 64 -s 42 -t 52 -tb 52 --cpu-tp 2 --no-warmup --temp 0 --no-display-prompt
 ```
 
-Both generated the same text. The baseline measured about 199 prompt tokens/s
-and 33.5 generation tokens/s. CPU-TP measured about 25.6 prompt tokens/s and
-12.0 generation tokens/s. This is not a useful performance direction for this
-model/host configuration.
+Both generated the same text. A later baseline sample measured about 201 prompt
+tokens/s and 44.5 generation tokens/s. CPU-TP measured about 66 prompt tokens/s
+and 13.5 generation tokens/s. This is not a useful performance direction for
+this model/host configuration.
 
-Server readiness remains unsafe for threaded CPU-TP on the Q4 model:
+Server readiness on the Q4 model:
 
-- `llama-server --cpu-tp 2 -t 1 -tb 1` reached `HTTP server listening`;
-- `-t 2`, `-t 4`, and `-t 16` also reached `HTTP server listening` in an
-  8-second timeout smoke;
-- `-t 8`, `-t 26`, and `-t 52` logged
-  `ggml/src/./iqk/fa/iqk_fa_templates.h:1157: GGML_ASSERT(S > 0) failed`
-  during or immediately after slot initialization and did not reach the ready
-  line within the timeout.
+- The server had been running `common_speculative_is_compat(ctx)` during slot
+  initialization even when no speculative decoding was requested. That helper
+  decodes dummy token IDs and triggered
+  `ggml/src/./iqk/fa/iqk_fa_templates.h:1157: GGML_ASSERT(S > 0)` for some
+  thread counts.
+- The speculative compatibility probe is now gated behind an actual
+  speculative-decoding request.
+- `llama-server --cpu-tp 2 -t 52 -tb 52 --no-warmup` reaches
+  `HTTP server listening` and serves a `/completion` request for the Q4 model.
+  The request generated the expected prefix and measured about 57 prompt
+  tokens/s and 13.2 generation tokens/s.
+- An uncommitted experiment that propagated the requested thread count into
+  CPU-NUMA child backends made CPU-TP slower and could re-trigger the
+  flash-attention assert, so it was not kept.
 
 Current verdict:
 
 CPU-NUMA tensor parallelism now has narrow CLI correctness evidence for F32 and
-Q4 smoke models, but it is not ready for Task 12 performance claims or
-serving-config adoption. The current implementation is slower than baseline on
-the local Q4 smoke and the server path has thread-count-sensitive flash
-attention asserts. Next work should either debug the threaded server split
-attention path or stop this spike as not performance-useful.
+Q4 smoke models, and the Q4 server path can now start and answer a request. It
+is still not ready for Task 12 performance claims or serving-config adoption.
+The current implementation is much slower than baseline on the local Q4 smoke.
+Next work should either find a CPU-TP scheduling/threading design that improves
+throughput or stop this spike as not performance-useful.
