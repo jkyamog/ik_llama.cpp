@@ -650,6 +650,35 @@ throughput gate is now met. Load time remains materially worse than the
 ordinary CPU baseline because the CPU-NUMA split-buffer path still allocates and
 copies about 120420 MiB during load.
 
+The initial split-buffer load path first-touched every CPU-NUMA shard with a
+zero write during allocation, then copied the real tensor bytes during
+`ggml_backend_tensor_set()`. For Qwen this doubled the memory traffic over the
+120420 MiB split buffer. CPU-NUMA split-buffer shards now allocate without the
+separate zero pass; the real tensor copy runs while pinned to the destination
+NUMA node, so the copy itself establishes page placement.
+
+Representative Qwen122B CPU-TP after copy-as-first-touch loading:
+
+- `-n 1` log:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-copy-firsttouch-t96-n1-pipefail.log`
+  loaded in about 236 s and generated `,`.
+- `-n 8` log:
+  `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-copy-firsttouch-t96-n8-pipefail.log`
+  generated `, I am a 20 year`, loaded in about 276 s, and measured about
+  4.34 tokens/s.
+
+The `-n 8` result is about 27% faster than the ordinary CPU generation baseline
+and only about 52 s slower to load in this local sample. This makes the
+representative CLI gate much closer to adoption-ready, but the server path
+still needs a deliberate validation run before changing serving config.
+
+Dense Q4 guard after the split-buffer load change:
+
+- Log: `/tmp/cpu-numa-tp-logs/cputp-q4-copy-firsttouch-t52-n16.log`
+- Output prefix remained `, there lived a young girl named Lily. Lily was a kind and`
+- Load time: about 1.7 s
+- Generation: about 34.0 tokens/s on the short `-n 16` smoke
+
 These checks passed under:
 
 ```bash
@@ -665,6 +694,7 @@ smoke models, including `--no-flash-attn`, and the Q4 server path can start and
 answer a request. The representative Qwen35MoE 122B Q8 short gate now matches
 the ordinary CPU baseline prefix after fixing split FFN norm handling. A
 MoE-only CPU-NUMA child thread heuristic now clears the representative Task H
-generation-throughput target on the apples-to-apples `-n 8` gate, but load time
-is materially worse. Next work should focus on the split-buffer load path and
-serving adoption risk before considering any serving-config change.
+generation-throughput target on the apples-to-apples `-n 8` gate, and
+copy-as-first-touch split loading narrows the large load-time penalty
+substantially. Next work should be a deliberate server validation and
+deployment decision rather than more CLI correctness debugging.

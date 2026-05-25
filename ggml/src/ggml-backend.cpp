@@ -784,37 +784,54 @@ static bool ggml_backend_cpu_numa_node_cpuset(uint32_t numa_node, cpu_set_t * cp
     return n_cpus > 0;
 }
 
+struct ggml_backend_cpu_numa_affinity_guard {
+    cpu_set_t previous;
+    bool affinity_set = false;
+    int get_rv = -1;
+
+    explicit ggml_backend_cpu_numa_affinity_guard(uint32_t numa_node) {
+        get_rv = pthread_getaffinity_np(pthread_self(), sizeof(previous), &previous);
+
+        cpu_set_t cpus;
+        if (get_rv == 0 && ggml_backend_cpu_numa_node_cpuset(numa_node, &cpus, sizeof(cpus))) {
+            cpu_set_t allowed;
+            CPU_ZERO(&allowed);
+            int n_allowed = 0;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &previous) && CPU_ISSET(cpu, &cpus)) {
+                    CPU_SET(cpu, &allowed);
+                    ++n_allowed;
+                }
+            }
+            if (n_allowed > 0) {
+                cpus = allowed;
+            }
+            const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+            if (set_rv == 0) {
+                affinity_set = true;
+            } else {
+                fprintf(stderr, "%s: warning: failed to bind to CPU-NUMA%u: %s\n",
+                        __func__, numa_node, strerror(set_rv));
+            }
+        }
+    }
+
+    ~ggml_backend_cpu_numa_affinity_guard() {
+        if (affinity_set && get_rv == 0) {
+            const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(previous), &previous);
+            if (set_rv != 0) {
+                fprintf(stderr, "%s: warning: failed to restore CPU affinity: %s\n", __func__, strerror(set_rv));
+            }
+        }
+    }
+};
+
 static void ggml_backend_cpu_numa_first_touch(uint32_t numa_node, void * data, size_t size) {
     if (data == nullptr || size == 0) {
         return;
     }
 
-    cpu_set_t previous;
-    const int get_rv = pthread_getaffinity_np(pthread_self(), sizeof(previous), &previous);
-
-    cpu_set_t cpus;
-    bool affinity_set = false;
-    if (get_rv == 0 && ggml_backend_cpu_numa_node_cpuset(numa_node, &cpus, sizeof(cpus))) {
-        cpu_set_t allowed;
-        CPU_ZERO(&allowed);
-        int n_allowed = 0;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-            if (CPU_ISSET(cpu, &previous) && CPU_ISSET(cpu, &cpus)) {
-                CPU_SET(cpu, &allowed);
-                ++n_allowed;
-            }
-        }
-        if (n_allowed > 0) {
-            cpus = allowed;
-        }
-        const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
-        if (set_rv == 0) {
-            affinity_set = true;
-        } else {
-            fprintf(stderr, "%s: warning: failed to bind first-touch to CPU-NUMA%u: %s\n",
-                    __func__, numa_node, strerror(set_rv));
-        }
-    }
+    ggml_backend_cpu_numa_affinity_guard guard(numa_node);
 
     const long page_size_sys = sysconf(_SC_PAGESIZE);
     const size_t page_size = page_size_sys > 0 ? (size_t) page_size_sys : (size_t) 4096;
@@ -823,13 +840,6 @@ static void ggml_backend_cpu_numa_first_touch(uint32_t numa_node, void * data, s
         ptr[offset] = 0;
     }
     ptr[size - 1] = 0;
-
-    if (affinity_set && get_rv == 0) {
-        const int set_rv = pthread_setaffinity_np(pthread_self(), sizeof(previous), &previous);
-        if (set_rv != 0) {
-            fprintf(stderr, "%s: warning: failed to restore CPU affinity: %s\n", __func__, strerror(set_rv));
-        }
-    }
 }
 
 static const char * ggml_backend_cpu_numa_buft_get_name(ggml_backend_buffer_type_t buft) {
@@ -884,6 +894,25 @@ struct ggml_backend_cpu_numa_split_buffer_context {
     std::vector<ggml_backend_buffer_t> shard_buffers;
 };
 
+static ggml_backend_buffer_t ggml_backend_cpu_numa_alloc_buffer_uninitialized(uint32_t numa_node, size_t size) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_numa_buffer_type(numa_node);
+    GGML_ASSERT(buft != nullptr);
+
+    size += TENSOR_ALIGNMENT;
+    void * data = malloc(size);
+    if (data == nullptr) {
+        fprintf(stderr, "%s: failed to allocate buffer of size %zu\n", __func__, size);
+        return nullptr;
+    }
+
+    return ggml_backend_buffer_init(buft, cpu_backend_buffer_i, data, size);
+}
+
+static void ggml_backend_cpu_numa_copy_to_node(uint32_t numa_node, void * dst, const void * src, size_t size) {
+    ggml_backend_cpu_numa_affinity_guard guard(numa_node);
+    memcpy(dst, src, size);
+}
+
 GGML_CALL static const char * ggml_backend_cpu_numa_split_buffer_get_name(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return "CPU-NUMA-Split";
@@ -918,11 +947,8 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_init_tensor(ggml_backen
             continue;
         }
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_numa_buffer_type((uint32_t) i);
-        GGML_ASSERT(buft != nullptr);
-
         const size_t shard_size = ggml_nbytes(split);
-        ggml_backend_buffer_t shard_buffer = ggml_backend_buft_alloc_buffer(buft, shard_size);
+        ggml_backend_buffer_t shard_buffer = ggml_backend_cpu_numa_alloc_buffer_uninitialized((uint32_t) i, shard_size);
         GGML_ASSERT(shard_buffer != nullptr);
 
         split->buffer = shard_buffer;
@@ -966,6 +992,7 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend
                 continue;
             }
             GGML_ASSERT(ggml_are_same_shape(tensor, split));
+            ggml_backend_cpu_numa_affinity_guard guard((uint32_t) i);
             memcpy(split->data, data, ggml_nbytes(tensor));
         }
     } else if (extra->split_dim == 0) {
@@ -988,6 +1015,7 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend
 
             const size_t src_offset = (ne0_acc / tt.blck_size) * tt.type_size;
             const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+            ggml_backend_cpu_numa_affinity_guard guard((uint32_t) i);
             for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
                 for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
                     const char * src = (const char *) data + i02*tensor->nb[2] + i01*tensor->nb[1] + src_offset;
@@ -1007,6 +1035,7 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend
             }
             GGML_ASSERT(split->type == tensor->type);
             GGML_ASSERT(split->ne[0] == tensor->ne[0]);
+            ggml_backend_cpu_numa_affinity_guard guard((uint32_t) i);
             for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
                 const char * src = (const char *) data + i02*tensor->nb[2] + ne1_acc*tensor->nb[1];
                 char       * dst = (char *) split->data + i02*split->nb[2];
@@ -1025,7 +1054,7 @@ GGML_CALL static void ggml_backend_cpu_numa_split_buffer_set_tensor(ggml_backend
             GGML_ASSERT(split->ne[0] == tensor->ne[0]);
             GGML_ASSERT(split->ne[1] == tensor->ne[1]);
             const char * src = (const char *) data + ne2_acc*tensor->nb[2];
-            memcpy(split->data, src, ggml_nbytes(split));
+            ggml_backend_cpu_numa_copy_to_node((uint32_t) i, split->data, src, ggml_nbytes(split));
             ne2_acc += split->ne[2];
         }
     } else {
