@@ -445,7 +445,15 @@ ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx,
 }
 
 ggml_context * create_tensors_helper::cpu_tp_context_for_tensor(ggml_context * ctx, const std::string & name) {
-    if (model.cpu_tp != 2 || ctx != split_ctx) {
+    if (model.cpu_tp != 2) {
+        return ctx;
+    }
+
+    if (name.find(".ffn_norm.") != std::string::npos) {
+        return split_ctx;
+    }
+
+    if (ctx != split_ctx) {
         return ctx;
     }
 

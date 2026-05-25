@@ -720,13 +720,17 @@ ggml_tensor * llm_build_context::get_input_tensor_sm_graph(ggml_context * ctx, g
 
 ggml_tensor * llm_build_context::do_split_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * the_norm, const llama_hparams & hparams,
         const llm_build_cb & cb, int id, int il_cb, bool is_norm) {
-    if (the_norm && the_norm->extra) {
-        auto norm = (ggml_split_tensor_t *)the_norm->extra;
-        GGML_ASSERT(norm->splits[id]);
+    if (the_norm) {
+        ggml_tensor * norm = the_norm;
+        if (the_norm->extra) {
+            auto split_norm = (ggml_split_tensor_t *)the_norm->extra;
+            GGML_ASSERT(split_norm->splits[id]);
+            norm = split_norm->splits[id];
+        }
         if (is_norm) {
-            cur = ggml_fused_norm(ctx, cur, norm->splits[id], hparams.f_norm_eps);
+            cur = ggml_fused_norm(ctx, cur, norm, hparams.f_norm_eps);
         } else {
-            cur = llm_build_context::llm_build_norm(ctx, cur, hparams, norm->splits[id], NULL, LLM_NORM_RMS, cb, il_cb);
+            cur = llm_build_context::llm_build_norm(ctx, cur, hparams, norm, NULL, LLM_NORM_RMS, cb, il_cb);
         }
         cb(cur, "inp_normed", il_cb);
     }
