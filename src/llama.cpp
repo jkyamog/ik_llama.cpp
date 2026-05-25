@@ -6496,17 +6496,14 @@ struct llama_model * llama_model_load_from_file(
             delete model;
             return nullptr;
         }
-        uint32_t numa_nodes = ggml_numa_node_count();
-        const uint32_t cpu_node_count = 2;
-        LLAMA_LOG_INFO("%s: CPU tensor-parallel requested: %u NUMA node(s) detected, using %u CPU node device(s)\n",
-                __func__, numa_nodes, cpu_node_count);
-        LLAMA_LOG_INFO("%s: CPU TP device names: CPU-NUMA0, CPU-NUMA1\n", __func__);
-        LLAMA_LOG_INFO("%s: CPU TP v1 is CPU-only; GPU/RPC mixed mode is not enabled yet\n", __func__);
-        // Per-node allocation accounting placeholders (Task 5 will implement actual allocation)
-        LLAMA_LOG_INFO("%s: CPU TP per-node allocation accounting: placeholders only (Task 5)\n", __func__);
-        // Store cpu_tp and effective CPU node count in model for device indexing
-        model->cpu_tp = params.cpu_tp;
-        model->cpu_node_count = cpu_node_count;
+        // CPU-NUMA tensor parallelism needs split buffer placement and cross-node
+        // reduction before it can produce correct split tensor results.
+        LLAMA_LOG_ERROR("%s: --cpu-tp 2 is experimental and not available yet\n", __func__);
+        LLAMA_LOG_ERROR("%s: CPU-NUMA split buffer placement is not implemented\n", __func__);
+        LLAMA_LOG_ERROR("%s: CPU-NUMA cross-node reduction is not implemented\n", __func__);
+        LLAMA_LOG_ERROR("%s: use --cpu-tp 0 (default) or --cpu-tp 1 (disabled-equivalent)\n", __func__);
+        delete model;
+        return nullptr;
     } else if (params.cpu_tp != 0) {
         // Invalid value - should have been caught by CLI but handle here as safety
         LLAMA_LOG_ERROR("%s: invalid cpu_tp value: %d\n", __func__, params.cpu_tp);
