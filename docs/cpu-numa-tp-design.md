@@ -145,3 +145,29 @@ Blocker:
 `ggml_backend_cpu_graph_compute()` ultimately calls `ggml_graph_compute()` in `ggml/src/ggml.c`, where worker threads are created and `set_numa_thread_affinity()` applies the global `--numa` strategy. That path does not receive backend-local NUMA node state, so calling an affinity helper at the backend boundary would only affect the caller thread, not the worker threads. Completing Task 5 requires carrying a per-backend NUMA node through `ggml_cplan` or an equivalent compute API into `ggml_graph_compute_thread()`.
 
 Until that is done, `CPU-NUMA*` buffer/backend names are placement plumbing and auditability only; they should not be treated as proof of node-local memory or compute.
+
+## Post Task 5b Review
+
+Task 5b added a backend-local NUMA node field to `ggml_cplan` and passes that value into worker-thread affinity. That is necessary, but review found the branch is still not meaningful CPU tensor parallelism. The current changes can make startup logs look promising while most runtime behavior remains ordinary CPU execution.
+
+Findings:
+
+1. CPU-NUMA tensor ownership can collapse onto the first CPU backend.
+
+   `ggml_backend_cpu_supports_buft()` still accepts any host buffer type. Since `CPU-NUMA0`, `CPU-NUMA1`, and fallback `CPU` are all CPU backends, `ggml_backend_sched_backend_from_buffer()` can pick the first CPU backend that supports the op even when the tensor buffer is `CPU-NUMA1`. CPU-node backends need NUMA-aware buffer support: a node backend should claim its own `CPU-NUMA*` buffer type, and fallback CPU should not steal those buffers.
+
+2. `--cpu-tp 2` does not yet force or validate CPU-NUMA tensor placement.
+
+   The flag creates synthetic CPU-NUMA device names, but with default `n_gpu_layers == 0`, `i_gpu_start == n_layer` and repeating layers stay on ordinary CPU buffers. Startup can show `CPU-NUMA0` and `CPU-NUMA1` even when representative model tensors are not placed on CPU-NUMA buffers. The flag must either establish the intended split/offload placement or reject startup unless the required placement flags are provided.
+
+3. CPU-NUMA compute buffers still use the generic CPU buffer type.
+
+   Scheduler setup currently assigns generic CPU host buffers to all CPU backends. CPU-node backends need matching `CPU-NUMA*` compute buffer types, otherwise temporary allocations are not node-specific and runtime logs are not enough to prove locality.
+
+Next tasks before split/reduction:
+
+- Make CPU backend `supports_buft` NUMA-aware.
+- Make `--cpu-tp 2` actually select or require CPU-NUMA tensor placement.
+- Use CPU-NUMA buffer types for CPU-NUMA scheduler compute buffers.
+
+Do not proceed to split tensor compute/reduction or performance tests until these are fixed and representative tensor placement is auditable.
