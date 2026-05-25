@@ -423,6 +423,12 @@ llama_model::~llama_model() {
 }
 
 static size_t llama_get_device_count(const llama_model & model) {
+    // CPU tensor-parallel: when cpu_tp=2, expose synthetic CPU-node devices
+    if (model.cpu_tp == 2 && ggml_is_numa()) {
+        // NUMA nodes are exposed as CPU-only devices for this experimental v1.
+        return model.cpu_node_count;
+    }
+
     size_t count = 1;
 #if defined(GGML_USE_CUDA)
     count = ggml_backend_cuda_get_device_count();
@@ -442,6 +448,13 @@ static size_t llama_get_device_count(const llama_model & model) {
 
 static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int gpu) {
     ggml_backend_buffer_type_t buft = nullptr;
+
+    // CPU tensor-parallel: handle CPU-node devices (indices 0..cpu_node_count-1)
+    if (model.cpu_tp == 2 && ggml_is_numa() && gpu < (int)model.cpu_node_count) {
+        // Return CPU buffer type for NUMA nodes - actual NUMA-specific allocation in Task 5
+        buft = llama_default_buffer_type_cpu(true);
+        return buft;
+    }
 
 #if defined(GGML_USE_RPC)
     int dev_count = (int)llama_get_device_count(model);
@@ -509,6 +522,24 @@ ggml_backend_buffer_type_t llama_model::default_buffer_type_offload(int device) 
 }
 
 static size_t llama_get_device_memory(const llama_model & model, int device) {
+    if (model.cpu_tp == 2 && device >= 0 && device < (int) model.cpu_node_count) {
+        size_t mem_available = 0;
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key;
+        size_t value = 0;
+        std::string unit;
+        while (meminfo >> key >> value >> unit) {
+            if (key == "MemAvailable:" || key == "MemFree:") {
+                mem_available = value * 1024;
+                break;
+            }
+        }
+        if (mem_available == 0) {
+            mem_available = 1ull << 40; // placeholder until per-node accounting is implemented
+        }
+        return mem_available / std::max<uint32_t>(1, model.cpu_node_count);
+    }
+
 #if defined(GGML_USE_RPC)
     int dev_count = (int)llama_get_device_count(model);
     int rpc_count = (int)model.rpc_servers.size();
@@ -6450,11 +6481,23 @@ struct llama_model * llama_model_load_from_file(
         // disabled-equivalent with explicit log
         LLAMA_LOG_INFO("%s: CPU tensor-parallel is disabled (cpu_tp=1, no splitting)\n", __func__);
     } else if (params.cpu_tp == 2) {
-        // request two NUMA devices - not yet implemented
-        LLAMA_LOG_ERROR("%s: CPU tensor-parallel with 2 NUMA devices requested (cpu_tp=2)\n", __func__);
-        LLAMA_LOG_ERROR("%s: ERROR: CPU NUMA TP backend plumbing not yet implemented (Task 4). This is an experimental feature.\n", __func__);
-        delete model;
-        return nullptr;
+        // request two NUMA devices - minimal plumbing (Task 4)
+        if (!ggml_is_numa()) {
+            LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) requires NUMA with >1 nodes\n", __func__);
+            delete model;
+            return nullptr;
+        }
+        uint32_t numa_nodes = ggml_numa_node_count();
+        const uint32_t cpu_node_count = 2;
+        LLAMA_LOG_INFO("%s: CPU tensor-parallel requested: %u NUMA node(s) detected, using %u CPU node device(s)\n",
+                __func__, numa_nodes, cpu_node_count);
+        LLAMA_LOG_INFO("%s: CPU TP device names: CPU-NUMA0, CPU-NUMA1\n", __func__);
+        LLAMA_LOG_INFO("%s: CPU TP v1 is CPU-only; GPU/RPC mixed mode is not enabled yet\n", __func__);
+        // Per-node allocation accounting placeholders (Task 5 will implement actual allocation)
+        LLAMA_LOG_INFO("%s: CPU TP per-node allocation accounting: placeholders only (Task 5)\n", __func__);
+        // Store cpu_tp and effective CPU node count in model for device indexing
+        model->cpu_tp = params.cpu_tp;
+        model->cpu_node_count = cpu_node_count;
     } else if (params.cpu_tp != 0) {
         // Invalid value - should have been caught by CLI but handle here as safety
         LLAMA_LOG_ERROR("%s: invalid cpu_tp value: %d\n", __func__, params.cpu_tp);
@@ -6474,14 +6517,31 @@ struct llama_model * llama_model_load_from_file(
     std::map<std::string, int32_t> buffer_names;
     std::vector<std::string> gpu_names;
     bool has_rpc = params.rpc_servers != nullptr && params.rpc_servers[0] != '\0';
+    if (model->cpu_tp == 2 && has_rpc) {
+        LLAMA_LOG_ERROR("%s: CPU tensor-parallel (cpu_tp=2) cannot be mixed with RPC devices yet\n", __func__);
+        delete model;
+        return nullptr;
+    }
+
     int32_t idx = 0;
     int dev_count = (int)llama_get_device_count(*model);
+
+    // CPU tensor-parallel: register CPU-NUMA device names for lookup
+    if (model->cpu_tp == 2 && ggml_is_numa()) {
+        for (uint32_t node = 0; node < model->cpu_node_count; node++) {
+            std::string cpu_node_name = format("CPU-NUMA%d", node);
+            buffer_names.insert({ cpu_node_name, (int32_t)node });
+            gpu_names.push_back(cpu_node_name);
+        }
+    }
     // list all buffer type names
-    for (idx = 0; idx < dev_count; idx++) {
-        ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(*model, idx);
-        const char* name = ggml_backend_buft_name(buft);
-        buffer_names.insert({ std::string(name), idx });
-        gpu_names.push_back(std::string(name));
+    if (model->cpu_tp != 2) {
+        for (idx = 0; idx < dev_count; idx++) {
+            ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(*model, idx);
+            const char* name = ggml_backend_buft_name(buft);
+            buffer_names.insert({ std::string(name), idx });
+            gpu_names.push_back(std::string(name));
+        }
     }
     if (has_rpc) {
         model->rpc_servers = extract_device_from_rpc_device(string_split(params.rpc_servers, ","));
@@ -6882,6 +6942,26 @@ struct llama_context * llama_init_from_model(
         const int main_gpu_id = (model->main_gpu >= 0 && model->main_gpu < (int)model->devices.size())
             ? model->devices[model->main_gpu]
             : model->main_gpu;
+        GGML_UNUSED(main_gpu_id);
+        const bool cpu_tp_active = model->cpu_tp == 2 && model->cpu_node_count > 0;
+
+        // CPU tensor-parallel: initialize CPU-node backends (Task 4 minimal plumbing)
+        if (cpu_tp_active) {
+            LLAMA_LOG_INFO("%s: initializing %u CPU-node backend(s) for CPU TP\n", __func__, model->cpu_node_count);
+            for (uint32_t node = 0; node < model->cpu_node_count; node++) {
+                ggml_backend_t cpu_node_backend = ggml_backend_cpu_init();
+                if (cpu_node_backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize CPU-NUMA%d backend\n", __func__, node);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                // Note: actual NUMA affinity/pinning will be implemented in Task 5
+                LLAMA_LOG_INFO("%s: CPU-NUMA%d backend initialized (placeholder for node-specific affinity)\n", __func__, node);
+                ctx->backends.push_back(cpu_node_backend);
+            }
+        }
+
+        if (!cpu_tp_active) {
 #if defined(GGML_USE_METAL)
         if (model->n_gpu_layers > 0) {
             ctx->backend_metal = ggml_backend_metal_init();
@@ -7005,6 +7085,7 @@ struct llama_context * llama_init_from_model(
         }
     }
 #endif
+        }
 
 #ifdef GGML_USE_BLAS
         ctx->backend_blas = ggml_backend_blas_init();

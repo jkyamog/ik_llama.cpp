@@ -905,6 +905,7 @@ extern "C" {
 
     GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API uint32_t ggml_numa_node_count(void); // returns number of NUMA nodes (0 if not initialized or single node)
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);

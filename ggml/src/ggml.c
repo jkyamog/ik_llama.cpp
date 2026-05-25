@@ -4685,6 +4685,10 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
+uint32_t ggml_numa_node_count(void) {
+    return g_state.numa.n_nodes;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 void ggml_print_object(const struct ggml_object * obj) {

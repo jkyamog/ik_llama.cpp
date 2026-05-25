@@ -452,6 +452,9 @@ struct llama_model {
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
+    // CPU tensor-parallel: number of CPU NUMA nodes when cpu_tp=2 (Task 4 plumbing)
+    uint32_t cpu_node_count = 0;
+    int32_t cpu_tp = 0;  // CPU tensor-parallel mode: 0=disabled, 1=disabled-equivalent, 2=request NUMA devices
     std::vector<int32_t> default_layer_device;
     std::vector<float>   aux_buffer;
 
