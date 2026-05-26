@@ -4,6 +4,7 @@
 #include "ggml-rpc.h"
 
 #include <cassert>
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cstdarg>
@@ -1744,6 +1745,7 @@ struct ggml_backend_sched {
 
 struct ggml_backend_sched_trace {
     bool enabled = false;
+    int split_detail_top = 0;
     int n_backends = 0;
     int n_splits = 0;
     int n_reduce_splits = 0;
@@ -1755,6 +1757,7 @@ struct ggml_backend_sched_trace {
     std::atomic<int64_t> reduce_eval_us{0};
     std::atomic<int64_t> eval_by_backend_us[GGML_SCHED_MAX_BACKENDS];
     std::atomic<int64_t> reduce_by_backend_us[GGML_SCHED_MAX_BACKENDS];
+    std::vector<int64_t> split_eval_us;
 
     ggml_backend_sched_trace() {
         for (int i = 0; i < GGML_SCHED_MAX_BACKENDS; ++i) {
@@ -1770,6 +1773,18 @@ static bool ggml_backend_sched_trace_enabled(void) {
         return value && value[0] != '\0' && strcmp(value, "0") != 0;
     }();
     return enabled;
+}
+
+static int ggml_backend_sched_split_trace_top(void) {
+    static int top = [] {
+        const char * value = getenv("IK_CPU_TP_SPLIT_TRACE_TOP");
+        if (value && value[0] != '\0') {
+            return atoi(value);
+        }
+        value = getenv("IK_CPU_TP_SPLIT_TRACE");
+        return value && value[0] != '\0' && strcmp(value, "0") != 0 ? 12 : 0;
+    }();
+    return top;
 }
 
 static bool ggml_backend_sched_isolate_reduce_enabled(void) {
@@ -1794,9 +1809,13 @@ static void ggml_backend_sched_trace_init(ggml_backend_sched_trace & trace, ggml
     if (!trace.enabled) {
         return;
     }
+    trace.split_detail_top = ggml_backend_sched_split_trace_top();
     trace.n_backends = sched->n_backends;
     trace.n_splits = sched->n_splits;
     trace.n_nodes = sched->graph.n_nodes;
+    if (trace.split_detail_top > 0) {
+        trace.split_eval_us.assign(sched->n_splits, 0);
+    }
     for (int i = 0; i < sched->n_splits; ++i) {
         const ggml_backend_sched_split * split = &sched->splits[i];
         trace.n_reduce_splits += ggml_backend_sched_split_is_reduce(split) ? 1 : 0;
@@ -1817,6 +1836,7 @@ static void ggml_backend_sched_trace_record_copy(ggml_backend_sched_trace * trac
 static void ggml_backend_sched_trace_record_eval(
         ggml_backend_sched_trace       * trace,
         const ggml_backend_sched_split * split,
+        int                             split_id,
         int                             backend_id,
         int64_t                         t0) {
     if (!trace || !trace->enabled) {
@@ -1827,12 +1847,85 @@ static void ggml_backend_sched_trace_record_eval(
     if (backend_id >= 0 && backend_id < GGML_SCHED_MAX_BACKENDS) {
         trace->eval_by_backend_us[backend_id].fetch_add(dt, std::memory_order_relaxed);
     }
+    if (split_id >= 0 && split_id < (int) trace->split_eval_us.size()) {
+        trace->split_eval_us[split_id] = dt;
+    }
     if (ggml_backend_sched_split_is_reduce(split)) {
         trace->reduce_eval_us.fetch_add(dt, std::memory_order_relaxed);
         if (backend_id >= 0 && backend_id < GGML_SCHED_MAX_BACKENDS) {
             trace->reduce_by_backend_us[backend_id].fetch_add(dt, std::memory_order_relaxed);
         }
     }
+}
+
+static size_t ggml_backend_sched_split_input_bytes(const ggml_backend_sched_split * split) {
+    size_t bytes = 0;
+    for (int i = 0; i < split->n_inputs; ++i) {
+        bytes += ggml_nbytes(split->inputs[i]);
+    }
+    return bytes;
+}
+
+static void ggml_backend_sched_trace_print_split_detail(
+        ggml_backend_sched_trace       * trace,
+        ggml_backend_sched_t             sched,
+        int                              split_id,
+        const ggml_backend_sched_split * split) {
+    std::array<int, GGML_OP_COUNT> op_counts = {};
+    int n_matmul = 0;
+    int n_reduce = 0;
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (node->op >= 0 && node->op < GGML_OP_COUNT) {
+            op_counts[node->op]++;
+        }
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+            n_matmul++;
+        }
+        if (node->op == GGML_OP_REDUCE) {
+            n_reduce++;
+        }
+    }
+
+    int top_ops[3] = { -1, -1, -1 };
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (op_counts[op] == 0) {
+            continue;
+        }
+        for (int pos = 0; pos < 3; ++pos) {
+            if (top_ops[pos] == -1 || op_counts[op] > op_counts[top_ops[pos]]) {
+                for (int shift = 2; shift > pos; --shift) {
+                    top_ops[shift] = top_ops[shift - 1];
+                }
+                top_ops[pos] = op;
+                break;
+            }
+        }
+    }
+
+    const ggml_tensor * first = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
+    const ggml_tensor * last  = split->graph.n_nodes > 0 ? split->graph.nodes[split->graph.n_nodes - 1] : nullptr;
+    fprintf(stderr,
+            "cpu-tp split trace: split=%d backend%d=%s eval_ms=%.3f nodes=%d range=%d:%d inputs=%d input_mb=%.3f matmul_nodes=%d reduce_nodes=%d first=%s:%s last=%s:%s ops=",
+            split_id,
+            split->backend_id,
+            ggml_backend_name(sched->backends[split->backend_id]),
+            trace->split_eval_us[split_id] / 1000.0,
+            split->graph.n_nodes,
+            split->i_start,
+            split->i_end,
+            split->n_inputs,
+            ggml_backend_sched_split_input_bytes(split) / 1048576.0,
+            n_matmul,
+            n_reduce,
+            first ? ggml_op_name(first->op) : "none",
+            first ? first->name : "none",
+            last ? ggml_op_name(last->op) : "none",
+            last ? last->name : "none");
+    for (int i = 0; i < 3 && top_ops[i] != -1; ++i) {
+        fprintf(stderr, "%s%s:%d", i == 0 ? "" : ",", ggml_op_name((enum ggml_op) top_ops[i]), op_counts[top_ops[i]]);
+    }
+    fprintf(stderr, "\n");
 }
 
 static void ggml_backend_sched_trace_print(ggml_backend_sched_trace * trace, ggml_backend_sched_t sched) {
@@ -1862,6 +1955,25 @@ static void ggml_backend_sched_trace_print(ggml_backend_sched_trace * trace, ggm
         }
     }
     fprintf(stderr, "\n");
+
+    if (trace->split_detail_top <= 0 || trace->split_eval_us.empty()) {
+        return;
+    }
+    std::vector<int> split_ids(trace->split_eval_us.size());
+    for (int i = 0; i < (int) split_ids.size(); ++i) {
+        split_ids[i] = i;
+    }
+    std::sort(split_ids.begin(), split_ids.end(), [trace] (int a, int b) {
+        return trace->split_eval_us[a] > trace->split_eval_us[b];
+    });
+    const int n_print = std::min(trace->split_detail_top, (int) split_ids.size());
+    for (int i = 0; i < n_print; ++i) {
+        const int split_id = split_ids[i];
+        if (trace->split_eval_us[split_id] <= 0) {
+            break;
+        }
+        ggml_backend_sched_trace_print_split_detail(trace, sched, split_id, &sched->splits[split_id]);
+    }
 }
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -2921,7 +3033,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     int64_t trace_t0 = ggml_time_us();
                     sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
-                    ggml_backend_sched_trace_record_eval(&trace, split, split_backend_id, trace_t0);
+                    ggml_backend_sched_trace_record_eval(&trace, split, i, split_backend_id, trace_t0);
 
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
@@ -3000,7 +3112,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     int64_t trace_t0 = ggml_time_us();
                     sched->statuses[ith] = ggml_backend_sched_eval(sched, split_backend, split);
-                    ggml_backend_sched_trace_record_eval(&trace, split, split_backend_id, trace_t0);
+                    ggml_backend_sched_trace_record_eval(&trace, split, i, split_backend_id, trace_t0);
                     if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
                         sched->needs_sync[split_backend_id] = true;
                     } else {
@@ -3083,7 +3195,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         int64_t trace_eval_t0 = ggml_time_us();
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
-        ggml_backend_sched_trace_record_eval(&trace, split, split_backend_id, trace_eval_t0);
+        ggml_backend_sched_trace_record_eval(&trace, split, i, split_backend_id, trace_eval_t0);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
