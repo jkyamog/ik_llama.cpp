@@ -1772,6 +1772,14 @@ static bool ggml_backend_sched_trace_enabled(void) {
     return enabled;
 }
 
+static bool ggml_backend_sched_isolate_reduce_enabled(void) {
+    static int enabled = [] {
+        const char * value = getenv("IK_CPU_TP_ISOLATE_REDUCE");
+        return value && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_backend_sched_split_is_reduce(const ggml_backend_sched_split * split) {
     for (int i = 0; i < split->graph.n_nodes; ++i) {
         if (split->graph.nodes[i]->op == GGML_OP_REDUCE) {
@@ -2077,6 +2085,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
     sched->has_reduce = false;
+    const bool isolate_reduce_splits = ggml_backend_sched_isolate_reduce_enabled();
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -2384,7 +2393,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
             if (node->op == GGML_OP_REDUCE) {
                 sched->has_reduce = true;
             }
-            if ((node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
+            if ((isolate_reduce_splits && i > 0 && graph->nodes[i - 1]->op == GGML_OP_REDUCE) ||
+                (node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
                  node->op == GGML_OP_REDUCE ||
                  node->op == GGML_OP_FAKE_CPY ||
                  node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 0xff) {
