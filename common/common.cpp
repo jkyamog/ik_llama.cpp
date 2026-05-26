@@ -723,9 +723,11 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_MODEL_ALIAS",      params.model_alias);
     get_env("LLAMA_ARG_HF_REPO",          params.hf_repo);
     get_env("LLAMA_ARG_HF_FILE",          params.hf_file);
-    get_env("LLAMA_ARG_THREADS",          params.n_threads);
-    get_env("LLAMA_ARG_CTX_SIZE",         params.n_ctx);
-    get_env("LLAMA_ARG_N_PARALLEL",       params.n_parallel);
+    get_env("LLAMA_ARG_THREADS",              params.n_threads);
+    get_env("LLAMA_ARG_CPU_TP_THREADS",       params.cpu_tp_n_threads);
+    get_env("LLAMA_ARG_CPU_TP_THREADS_BATCH", params.cpu_tp_n_threads_batch);
+    get_env("LLAMA_ARG_CTX_SIZE",             params.n_ctx);
+    get_env("LLAMA_ARG_N_PARALLEL",           params.n_parallel);
     get_env("LLAMA_ARG_BATCH",            params.n_batch);
     get_env("LLAMA_ARG_UBATCH",           params.n_ubatch);
     get_env("LLAMA_ARG_N_GPU_LAYERS",     params.n_gpu_layers);
@@ -2131,6 +2133,42 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--cpu-tp-threads") {
+        CHECK_ARG
+        int32_t value;
+        try {
+            value = std::stoi(argv[i]);
+        } catch (...) {
+            std::cerr << "error: --cpu-tp-threads requires a non-negative integer value" << std::endl;
+            invalid_param = true;
+            return true;
+        }
+        if (value < 0) {
+            std::cerr << "error: --cpu-tp-threads must be >= 0, got: " << value << std::endl;
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_tp_n_threads = value;
+        return true;
+    }
+    if (arg == "--cpu-tp-threads-batch") {
+        CHECK_ARG
+        int32_t value;
+        try {
+            value = std::stoi(argv[i]);
+        } catch (...) {
+            std::cerr << "error: --cpu-tp-threads-batch requires a non-negative integer value" << std::endl;
+            invalid_param = true;
+            return true;
+        }
+        if (value < 0) {
+            std::cerr << "error: --cpu-tp-threads-batch must be >= 0, got: " << value << std::endl;
+            invalid_param = true;
+            return true;
+        }
+        params.cpu_tp_n_threads_batch = value;
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3142,6 +3180,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --cpu-tp N",             "experimental CPU tensor-parallel: 0=disabled (default), 1=disabled-equivalent with log, 2=request 2 NUMA devices" });
+    options.push_back({ "*",           "       --cpu-tp-threads N",     "CPU-TP NUMA backend threads for generation (0 = threads / CPU-TP nodes, default)" });
+    options.push_back({ "*",           "       --cpu-tp-threads-batch N", "CPU-TP NUMA backend threads for batch/prompt processing (0 = use --cpu-tp-threads or threads-batch / CPU-TP nodes, default)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -4151,6 +4191,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_ubatch          = n_ubatch;
     cparams.n_threads         = params.n_threads;
     cparams.n_threads_batch   = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
+    cparams.cpu_tp_n_threads       = params.cpu_tp_n_threads       < 0 ? 0 : params.cpu_tp_n_threads;
+    cparams.cpu_tp_n_threads_batch = params.cpu_tp_n_threads_batch < 0 ? 0 : params.cpu_tp_n_threads_batch;
     cparams.seed              = params.seed;
     cparams.logits_all        = params.logits_all;
     cparams.embeddings        = params.embedding;

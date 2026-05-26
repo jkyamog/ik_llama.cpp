@@ -624,9 +624,20 @@ Follow-up CPU-NUMA child backend thread tuning:
   MoE target improved generation. At 16 child backend threads, the `-n 4`
   short gate generated `, I am a` and measured about 3.30 tokens/s. At 24 child
   backend threads it regressed to about 2.99 tokens/s.
-- The kept heuristic is therefore MoE-only: for `--cpu-tp 2` models with
-  experts, CPU-NUMA child backends use `clamp(n_threads / 6, 4, 16)` threads.
-  Dense models keep the previous default child backend threading.
+- The initial kept heuristic was MoE-only: for `--cpu-tp 2` models with
+  experts, CPU-NUMA child backends used `clamp(n_threads / 6, 4, 16)` threads.
+  Dense models kept the previous default child backend threading.
+- The OpenClaw rerun showed CPU-TP generation close to but still below the
+  clean `origin/main` baseline, while core utilization looked lower than the
+  later ordinary CPU run. Decision: keep the heuristic as the default because
+  previous dense Q4 trials regressed badly when child backend threads were
+  raised globally, but expose explicit trial knobs:
+  `--cpu-tp-threads N` for generation and `--cpu-tp-threads-batch N` for
+  prompt/batch processing. After observing that the host is mainly dedicated to
+  large model serving, the default was changed to divide total graph threads by
+  CPU-TP node count: with `--cpu-tp 2 -t 96 -tb 96`, each NUMA child backend
+  gets 48 threads. `0` means that default division; if only
+  `--cpu-tp-threads` is set, batch CPU-TP child backends use that override too.
 - The rebuilt-source Qwen35MoE 122B Q8 short gate with this heuristic generated
   `, I am a`, loaded in about 382 s, and measured about 3.60 tokens/s:
 
@@ -724,6 +735,70 @@ Representative Qwen122B CPU-TP OpenClaw payload smoke:
     65.80 prompt tokens/s, 5.74 generated tokens/s.
   - Caveat: `origin/main` ignored the MTP-layer tensors from this GGUF, so this
     is a practical pre-branch baseline, not a same-feature MTP/CPU-TP comparison.
+- CPU-TP child-thread 48/48 trial:
+  - Command shape:
+    `llama-server -m <Qwen122B Q8 split GGUF> -t 96 -tb 96 -c 32768 -b 128 -ub 128 --no-warmup --temp 0.6 --cpu-tp 2 --cpu-tp-threads 48 --cpu-tp-threads-batch 48 --host 127.0.0.1 --port 18080 --log-format text`
+  - Server log:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-openclaw-c32768-cputpthreads48-p18080.log`
+  - Payload output:
+    `/tmp/cpu-numa-tp-openclaw-smoke-cputpthreads48/payload_local_20260525_224727`
+  - Result: HTTP 200, 26,747 prompt tokens, 64 generated tokens,
+    44.62 prompt tokens/s, 4.12 generated tokens/s.
+  - This improved prompt throughput over the prior clean CPU-TP run
+    (34.55 prompt tokens/s) but regressed generation versus the prior CPU-TP
+    run (5.13 generated tokens/s), and still trailed clean `origin/main` on
+    both metrics.
+  - Operator observation during the 48/48 run: threads were broadly loaded, but
+    per-core utilization appeared around 50-75% and CPU package power around
+    150 W of a 205 W envelope. Treat the resulting 20-25% possible uplift as a
+    theoretical headroom target, not a measured expectation; likely blockers
+    include synchronization, memory bandwidth, NUMA locality, and shard
+    scheduling overhead.
+  - Memory check on the live process showed about 128.5 GiB RSS, not 2x model
+    memory. `numastat -p` showed private memory split across both nodes, about
+    63.4 GiB on node 0 and 67.4 GiB on node 1. This is expected: CPU-TP is
+    tensor-parallel sharding, not model replication. The TG deficit is therefore
+    more likely bandwidth/scheduling limited than caused by missing replicated
+    weights. This run also did not use speculative/MTP generation, so TG was
+    ordinary single-token generation.
+- CPU-TP child-thread 16/48 trial with a 1024-token generation window:
+  - Command shape:
+    `llama-server -m <Qwen122B Q8 split GGUF> -t 96 -tb 96 -c 32768 -b 128 -ub 128 --no-warmup --temp 0.6 --cpu-tp 2 --cpu-tp-threads 16 --cpu-tp-threads-batch 48 --host 127.0.0.1 --port 18080 --log-format text`
+  - Server log:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-server-openclaw-c32768-cputpthreads16-48-maxtok1024-p18080.log`
+  - Payload output:
+    `/tmp/cpu-numa-tp-openclaw-smoke-cputpthreads16-48-maxtok1024/payload_local_20260525_230542`
+  - Result: HTTP 200, 26,747 prompt tokens, 1,024 generated tokens,
+    45.67 prompt tokens/s, 5.41 generated tokens/s.
+  - This keeps the PP gain from higher batch child threads and recovers TG
+    close to the clean `origin/main` 64-token TG sample. The longer 1,024-token
+    window is a more meaningful TG measurement than the earlier 64-token smoke.
+  - Interpretation: for non-MTP serving, lower generation child threads and
+    higher prompt/batch child threads are likely a better default shape than
+    `96/96` everywhere. MTP is not changed by these flags, but it should be
+    tested separately because MTP decode is more batch-like and may prefer the
+    runner's higher `-t/-tb` shape.
+- Runner-shaped MTP comparison:
+  - Shared serving shape: `-t 96 -tb 96 -c 32768 -b 1024 -ub 1024 --temp 0.6
+    --top-p 0.95 --top-k 20 --min-p 0 --multi-token-prediction --spec-type
+    mtp --draft-n 8 --draft-min 0 --draft-p-min 0.8`, 1,024 generated token
+    cap. This uses the checked-in Qwen3.5 122B MTP runner batch/thread shape,
+    not the earlier `128/128` smoke batch.
+  - Clean `origin/main` MTP baseline:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-main-mtp-server-openclaw-c32768-b1024-maxtok1024-p18080.log`,
+    output
+    `/tmp/cpu-numa-tp-openclaw-smoke-main-mtp-b1024-maxtok1024/payload_local_20260525_234439`.
+    Result: HTTP 200, 26,747 prompt tokens, 1,024 generated tokens,
+    121.69 prompt tokens/s, 5.82 generated tokens/s, draft acceptance 0.778.
+  - CPU-TP MTP 48/48 child-thread run:
+    `/tmp/cpu-numa-tp-logs/qwen122b-q8-cputp-mtp-server-openclaw-c32768-b1024-cputpthreads48-48-maxtok1024-p18080.log`,
+    output
+    `/tmp/cpu-numa-tp-openclaw-smoke-cputp-mtp-b1024-cputpthreads48-48-maxtok1024/payload_local_20260525_235403`.
+    Result: HTTP 200, 26,747 prompt tokens, 1,024 generated tokens,
+    50.57 prompt tokens/s, 4.78 generated tokens/s, draft acceptance 0.824.
+  - Interpretation: MTP itself works on CPU-TP, and acceptance was not the
+    problem. CPU-TP still trails heavily on PP and also trails TG in this
+    MTP/48/48 shape. The PP deficit remains the primary blocker.
 - Task H outcome: this proves the CPU-TP long-prompt server path is functional,
   but it does not beat the clean `origin/main` baseline on this payload. Keep
   the branch as validated CPU-NUMA TP work, but do not deploy it as the active
@@ -767,4 +842,8 @@ stopping unrelated services improved CPU-TP OpenClaw generation from 0.89 to
 5.13 tokens/s, but the clean `origin/main` baseline still measured 5.74
 tokens/s on the same payload shape. This branch is validated for CPU-NUMA TP
 functionality but should not be adopted as the active serving config on current
-performance evidence. No active serving config has been changed in this spike.
+performance evidence. A 48/48 child-thread trial improved prompt throughput but
+regressed generation throughput, so the next optimization pass should focus on
+theoretical headroom from synchronization, memory bandwidth, NUMA locality, and
+shard scheduling rather than only increasing worker counts. No active serving
+config has been changed in this spike.

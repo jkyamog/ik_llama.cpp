@@ -11,6 +11,8 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_threads;       // number of threads to use for generation
     uint32_t n_threads_batch; // number of threads to use for batch processing
+    uint32_t cpu_tp_n_threads;       // CPU-TP NUMA backend threads for generation, 0 = use heuristic
+    uint32_t cpu_tp_n_threads_batch; // CPU-TP NUMA backend threads for batch processing, 0 = use heuristic
 
     std::vector<std::string> devices;
     std::vector<std::string> devices_draft;

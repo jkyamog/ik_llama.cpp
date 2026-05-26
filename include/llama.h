@@ -444,6 +444,8 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_threads;         // number of threads to use for generation
         uint32_t n_threads_batch;   // number of threads to use for batch processing
+        uint32_t cpu_tp_n_threads;       // CPU-TP NUMA backend threads for generation, 0 = use heuristic
+        uint32_t cpu_tp_n_threads_batch; // CPU-TP NUMA backend threads for batch processing, 0 = use heuristic
         int32_t  max_extra_alloc;   // Max. additional VRAM the scheduler is allowed to allocate
         int32_t  worst_case_tokens; // number of tokens to use when reserving worst case graphs
 

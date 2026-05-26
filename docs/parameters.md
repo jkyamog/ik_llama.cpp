@@ -70,6 +70,8 @@ Some often used terms.
 | `-t, --threads N` | Number of threads to use during generation | 4 | Try to match the number of physical CPU cores. Avoid odd numbers (e.g. 1,3,...). |
 | `-tb, --threads-batch N` | Number of threads to use during batch and prompt processing | Same as `--threads` | Same as `--threads` When doing full GPU offload, use a lower number (e.g. 2) |
 | `-tm,   --threads-mtmd N` | Number of threads to use during multimodal image processing | Same as `--threads-batch` | Control CPU thread count used during multimodal image/audio processing (mmproj encoding), separate from the main LLM thread count. |
+| `--cpu-tp-threads N` | CPU-TP NUMA backend threads during generation | `--threads / CPU-TP nodes` | Experimental `--cpu-tp 2` tuning knob. `0` keeps the default per-node division. |
+| `--cpu-tp-threads-batch N` | CPU-TP NUMA backend threads during batch and prompt processing | `--cpu-tp-threads`, then `--threads-batch / CPU-TP nodes` | Experimental `--cpu-tp 2` tuning knob. `0` keeps the generation override or default per-node division. |
 | `-c, --ctx-size N` | Size of the prompt context | 0 (loaded from model) | Influences the size of KV size (memory) therefore look for a value that fits your system then increase as needed (2048, 4096,…). If you use parallel slots, this context size will be split across the slots. |
 | `-n, --predict N` | Number of tokens to predict | -1 (infinity) | -1 (infinity), -2 (until context filled). Safe to leave default. |
 | `-b, --batch-size N` | Logical maximum batch size | 2048 | Safe to leave default. Higher values may give better t/s especially on GPU, while using more memory. |

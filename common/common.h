@@ -265,6 +265,8 @@ struct gpt_params {
 
     int32_t n_threads             = cpu_get_num_math();
     int32_t n_threads_batch       =      -1; // number of threads to use for batch processing (-1 = use n_threads)
+    int32_t cpu_tp_n_threads       =      0; // CPU-TP NUMA backend threads for generation (0 = use heuristic)
+    int32_t cpu_tp_n_threads_batch =      0; // CPU-TP NUMA backend threads for batch processing (0 = use heuristic)
     int32_t n_predict             =      -1; // new tokens to predict
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)

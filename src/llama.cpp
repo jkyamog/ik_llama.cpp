@@ -4958,10 +4958,23 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 }
 
 
+static int llama_cpu_tp_node_threads(const llama_context & lctx, int n_threads, bool is_batch) {
+    uint32_t override_threads = is_batch ? lctx.cparams.cpu_tp_n_threads_batch : lctx.cparams.cpu_tp_n_threads;
+    if (override_threads == 0 && is_batch) {
+        override_threads = lctx.cparams.cpu_tp_n_threads;
+    }
+    if (override_threads > 0) {
+        return override_threads;
+    }
+    const int node_count = std::max(1, (int) lctx.model.cpu_node_count);
+    return std::max(1, (n_threads + node_count - 1) / node_count);
+}
+
 static void llama_graph_compute(
         llama_context & lctx,
           ggml_cgraph * gf,
-                  int   n_threads) {
+                  int   n_threads,
+                 bool   is_batch) {
 #ifdef GGML_USE_METAL
     if (ggml_backend_is_metal(lctx.backend_metal)) {
         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
@@ -4974,7 +4987,7 @@ static void llama_graph_compute(
     }
 #ifdef __gnu_linux__
     if (lctx.model.cpu_tp == 2 && lctx.model.hparams.n_expert > 0) {
-        const int node_threads = std::max(4, std::min(16, n_threads / 6));
+        const int node_threads = llama_cpu_tp_node_threads(lctx, n_threads, is_batch);
         for (ggml_backend_t backend : lctx.backends) {
             if (ggml_backend_is_cpu(backend) && ggml_backend_cpu_get_numa_node(backend) >= 0) {
                 ggml_backend_cpu_set_n_threads(backend, node_threads);
@@ -5385,7 +5398,7 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
         tim1 = ggml_time_us();
 #endif
-        llama_graph_compute(lctx, gf, n_threads);
+        llama_graph_compute(lctx, gf, n_threads, n_tokens != 1);
 #if IK_PRINT_TIMING
         llama_synchronize(&lctx);
         tim2 = ggml_time_us();
@@ -5667,7 +5680,7 @@ static int llama_encode_internal(
 
     llama_set_inputs(lctx, batch);
 
-    llama_graph_compute(lctx, gf, n_threads);
+    llama_graph_compute(lctx, gf, n_threads, n_tokens != 1);
 
     // extract embeddings
     if (embd) {
@@ -5948,7 +5961,7 @@ static void llama_kv_cache_defrag_internal(struct llama_context & lctx) {
 
     ggml_cgraph * gf = llm_build_context::llama_build_graph_defrag(lctx, ids);
 
-    llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+    llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
 #endif
 
     //const int64_t t_end = ggml_time_us();
@@ -5980,7 +5993,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             llama_set_k_shift(lctx);
 
-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
 
             need_reserve = true;
         }
@@ -6006,7 +6019,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             llama_set_s_copy(lctx);
 
-            llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
+            llama_graph_compute(lctx, gf, lctx.cparams.n_threads, false);
 
             need_reserve = true;
         }
@@ -6329,6 +6342,8 @@ struct llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.cpu_tp_n_threads            =*/ 0,
+        /*.cpu_tp_n_threads_batch      =*/ 0,
         /*.max_extra_alloc             =*/ 256,
         /*.worst_case_tokens           =*/ 0,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -6797,6 +6812,8 @@ struct llama_context * llama_init_from_model(
     cparams.n_seq_max        = std::max(1u, params.n_seq_max);
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
+    cparams.cpu_tp_n_threads       = params.cpu_tp_n_threads;
+    cparams.cpu_tp_n_threads_batch = params.cpu_tp_n_threads_batch;
     cparams.yarn_ext_factor  = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;

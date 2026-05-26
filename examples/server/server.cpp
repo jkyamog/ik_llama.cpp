@@ -478,10 +478,12 @@ int main(int argc, char ** argv) {
     });
 
     LOG_INFO("system info", {
-        {"n_threads",       params.n_threads},
-        {"n_threads_batch", params.n_threads_batch},
-        {"total_threads",   std::thread::hardware_concurrency()},
-        {"system_info",     llama_print_system_info()},
+        {"n_threads",              params.n_threads},
+        {"n_threads_batch",        params.n_threads_batch},
+        {"cpu_tp_n_threads",       params.cpu_tp_n_threads},
+        {"cpu_tp_n_threads_batch", params.cpu_tp_n_threads_batch},
+        {"total_threads",          std::thread::hardware_concurrency()},
+        {"system_info",            llama_print_system_info()},
     });
 
     std::unique_ptr<httplib::Server> svr;
