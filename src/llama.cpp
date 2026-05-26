@@ -3744,6 +3744,25 @@ static bool llm_load_tensors(
         }
     }
 
+    if (model.cpu_tp == 2 && device_count > 1) {
+        const char * cpu_tp_layer_placement = getenv("IK_CPU_TP_LAYER_PLACEMENT");
+        if (cpu_tp_layer_placement &&
+            (strcmp(cpu_tp_layer_placement, "alternate") == 0 ||
+             strcmp(cpu_tp_layer_placement, "alternate1") == 0)) {
+            const int layer_offset = strcmp(cpu_tp_layer_placement, "alternate1") == 0 ? 1 : 0;
+            LLAMA_LOG_INFO("%s: CPU tensor-parallel alternating single-backend layer placement across %d CPU-NUMA nodes\n",
+                    __func__, device_count);
+            for (int il = i_gpu_start; il < n_layer; ++il) {
+                if (model.mtp && hparams.nextn_predict_layers > 0 &&
+                    static_cast<uint32_t>(il) >= static_cast<uint32_t>(n_layer) - hparams.nextn_predict_layers) {
+                    continue;
+                }
+                model.default_layer_device[il] = (il + layer_offset) % device_count;
+                LLAMA_LOG_INFO("Setting CPU-TP default device in layer %2d to %d\n", il, model.default_layer_device[il]);
+            }
+        }
+    }
+
     // assign the repeating layers to the devices according to the splits
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
         for (int i = i_gpu_start; i < n_layer; ++i) {
