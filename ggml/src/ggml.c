@@ -141,6 +141,70 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
+#if !defined(_WIN32)
+struct ggml_reduce_trace_state {
+    atomic_llong thread_us;
+    atomic_llong calls_thread;
+    atomic_llong calls_ith0;
+    atomic_llong elements_ith0;
+    atomic_llong f32_calls_ith0;
+    atomic_llong f16_calls_ith0;
+    atomic_llong bf16_calls_ith0;
+    atomic_bool  initialized;
+};
+
+static struct ggml_reduce_trace_state g_reduce_trace = {
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(0),
+    ATOMIC_VAR_INIT(false),
+};
+
+static bool ggml_reduce_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * value = getenv("IK_CPU_TP_REDUCE_TRACE");
+        enabled = value && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return enabled != 0;
+}
+
+static void ggml_reduce_trace_print(void) {
+    if (!ggml_reduce_trace_enabled()) {
+        return;
+    }
+    const long long calls = atomic_load_explicit(&g_reduce_trace.calls_ith0, memory_order_relaxed);
+    if (calls == 0) {
+        return;
+    }
+    const long long thread_us = atomic_load_explicit(&g_reduce_trace.thread_us, memory_order_relaxed);
+    const long long calls_thread = atomic_load_explicit(&g_reduce_trace.calls_thread, memory_order_relaxed);
+    const long long elements = atomic_load_explicit(&g_reduce_trace.elements_ith0, memory_order_relaxed);
+    fprintf(stderr,
+            "cpu-tp reduce trace: calls=%lld thread_calls=%lld thread_ms=%.3f avg_thread_us=%.3f elements=%lld avg_elements=%.3f f32_calls=%lld f16_calls=%lld bf16_calls=%lld\n",
+            calls,
+            calls_thread,
+            thread_us / 1000.0,
+            calls_thread ? (double) thread_us / (double) calls_thread : 0.0,
+            elements,
+            calls ? (double) elements / (double) calls : 0.0,
+            atomic_load_explicit(&g_reduce_trace.f32_calls_ith0, memory_order_relaxed),
+            atomic_load_explicit(&g_reduce_trace.f16_calls_ith0, memory_order_relaxed),
+            atomic_load_explicit(&g_reduce_trace.bf16_calls_ith0, memory_order_relaxed));
+}
+
+static void ggml_reduce_trace_init_once(void) {
+    bool expected = false;
+    if (atomic_compare_exchange_strong_explicit(&g_reduce_trace.initialized, &expected, true, memory_order_relaxed, memory_order_relaxed)) {
+        atexit(ggml_reduce_trace_print);
+    }
+}
+#endif
+
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
 #endif
@@ -6146,6 +6210,14 @@ static void ggml_compute_forward_reduce_add(
               struct ggml_tensor * dst) {
     GGML_ASSERT(dst->op_params[0] == GGML_OP_ADD);
 
+#if !defined(_WIN32)
+    const bool trace_reduce = ggml_reduce_trace_enabled();
+    const int64_t trace_t0 = trace_reduce ? ggml_time_us() : 0;
+    if (trace_reduce) {
+        ggml_reduce_trace_init_once();
+    }
+#endif
+
     const int nreduce = dst->op_params[1];
     const int nhave   = dst->op_params[2];
     GGML_ASSERT(nreduce > 1 && nreduce <= GGML_MAX_SRC);
@@ -6215,6 +6287,30 @@ static void ggml_compute_forward_reduce_add(
         default:
             GGML_ABORT("%s: unsupported CPU reduce-add type %s", __func__, ggml_type_name(dst->type));
     }
+
+#if !defined(_WIN32)
+    if (trace_reduce) {
+        atomic_fetch_add_explicit(&g_reduce_trace.thread_us, ggml_time_us() - trace_t0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_reduce_trace.calls_thread, 1, memory_order_relaxed);
+        if (params->ith == 0) {
+            atomic_fetch_add_explicit(&g_reduce_trace.calls_ith0, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_reduce_trace.elements_ith0, ggml_nelements(dst), memory_order_relaxed);
+            switch (dst->type) {
+                case GGML_TYPE_F32:
+                    atomic_fetch_add_explicit(&g_reduce_trace.f32_calls_ith0, 1, memory_order_relaxed);
+                    break;
+                case GGML_TYPE_F16:
+                    atomic_fetch_add_explicit(&g_reduce_trace.f16_calls_ith0, 1, memory_order_relaxed);
+                    break;
+                case GGML_TYPE_BF16:
+                    atomic_fetch_add_explicit(&g_reduce_trace.bf16_calls_ith0, 1, memory_order_relaxed);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+#endif
 }
 
 struct ggml_tensor * ggml_fake_cpy(
